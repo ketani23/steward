@@ -1,0 +1,55 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/steward-types",
+    "crates/steward-security",
+    "crates/steward-memory",
+    "crates/steward-tools",
+    "crates/steward-core",
+    "crates/steward-channels",
+]
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/anthropics/steward"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# HTTP
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+axum = { version = "0.8", features = ["macros"] }
+
+# Database
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "json"] }
+
+# Crypto
+aes-gcm = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
+
+# Utilities
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
+regex = "1"
+
+# Internal crates
+steward-types = { path = "crates/steward-types" }
+steward-security = { path = "crates/steward-security" }
+steward-memory = { path = "crates/steward-memory" }
+steward-tools = { path = "crates/steward-tools" }
+steward-core = { path = "crates/steward-core" }
+steward-channels = { path = "crates/steward-channels" }

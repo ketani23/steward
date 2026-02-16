@@ -1,0 +1,29 @@
+# Steward Guardrails Configuration
+# Global safety constraints that apply across all permission tiers.
+# See docs/architecture.md section 5.7 for configuration-as-code design.
+
+global_rate_limit: 120  # Maximum actions per minute across all tiers
+
+forbidden_patterns:
+  # Patterns that should never appear in outbound content
+  - "(?i)ignore\\s+(previous|prior|above)\\s+instructions?"
+  - "(?i)you\\s+are\\s+now\\s+a"
+  - "(?i)system\\s*:\\s*"
+
+circuit_breaker_defaults:
+  error_threshold: 5
+  error_window_secs: 60
+  latency_threshold_secs: 30
+  recovery_timeout_secs: 120
+  recovery_probes: 3
+  max_recovery_backoff_secs: 900
+
+egress:
+  max_outbound_per_minute: 20
+  max_recipients_per_message: 10
+  pii_scan_enabled: true
+  secret_scan_enabled: true
+
+ingress:
+  max_content_chars: 100000  # ~25k tokens context budget
+  injection_detection_enabled: true

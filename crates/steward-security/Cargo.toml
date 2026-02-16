@@ -1,0 +1,15 @@
+[package]
+name = "steward-security"
+version = "0.1.0"
+edition.workspace = true
+description = "Security subsystem for Steward: ingress sanitization, egress filtering, secret management, leak detection, and audit logging"
+
+[dependencies]
+steward-types.workspace = true
+async-trait.workspace = true
+regex.workspace = true
+tokio.workspace = true
+sqlx.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true

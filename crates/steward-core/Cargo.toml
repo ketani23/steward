@@ -1,0 +1,14 @@
+[package]
+name = "steward-core"
+version = "0.1.0"
+edition.workspace = true
+description = "Core agent loop for Steward: LLM interaction, guardian review, permission enforcement, and routing"
+
+[dependencies]
+steward-types.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+reqwest.workspace = true

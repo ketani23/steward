@@ -1,0 +1,15 @@
+[package]
+name = "steward-tools"
+version = "0.1.0"
+edition.workspace = true
+description = "Tool subsystem for Steward: tool registry, MCP proxy, WASM sandbox, and staging"
+
+[dependencies]
+steward-types.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+tracing.workspace = true
+reqwest.workspace = true

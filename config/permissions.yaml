@@ -1,0 +1,54 @@
+# Steward Permission Manifest
+# Classifies every action into a permission tier.
+# See docs/architecture.md Ring 1 (Permission Engine) for design rationale.
+
+tiers:
+  auto_execute:
+    description: "Safe read-only operations"
+    actions:
+      - calendar.read
+      - email.read
+      - weather.check
+      - memory.search
+      - web.search
+    constraints:
+      rate_limit: 60/minute
+
+  log_and_execute:
+    description: "Low-risk writes, auto-allowed but audited"
+    actions:
+      - reminder.create
+      - note.create
+      - message.draft
+      - file.read
+    constraints:
+      rate_limit: 30/minute
+
+  human_approval:
+    description: "High-risk actions requiring explicit confirmation"
+    actions:
+      - email.send
+      - message.send
+      - file.modify
+      - file.write
+      - calendar.create
+      - calendar.modify
+      - purchase.any
+      - shell.exec
+    confirmation:
+      channel: same_as_request
+      show:
+        - action
+        - params
+        - reasoning
+        - guardian_verdict
+      timeout: 5m
+
+  forbidden:
+    description: "Hard-blocked regardless of LLM output"
+    actions:
+      - credentials.read_raw
+      - system_prompt.modify
+      - permissions.modify
+      - data.bulk_delete
+      - agent.self_modify
