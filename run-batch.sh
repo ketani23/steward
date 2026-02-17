@@ -51,10 +51,10 @@ for i in {1..${#BRANCHES[@]}}; do
   echo "  Creating tmux window: $branch"
   tmux new-window -t "$SESSION" -n "$branch"
 
-  # Build the command to run in the tmux window
-  # Claude Code reads CLAUDE.md and .claude/settings.json from the project root
+  # Launch Claude Code in interactive mode so you can watch live progress.
+  # The task prompt is piped as the first message via --resume-prompt.
   tmux send-keys -t "$SESSION:$branch" \
-    "cd $wt_dir && claude -p \"\$(cat docs/tasks/${task_file})\" --permission-mode dontAsk 2>&1 | tee /tmp/steward-${branch}.log; echo '=== DONE ===' " \
+    "cd $wt_dir && claude --resume-prompt \"\$(cat docs/tasks/${task_file})\" --permission-mode dontAsk" \
     Enter
 
   echo "  Launched Claude Code for $task_file"
@@ -69,11 +69,7 @@ echo "  tmux attach -t $SESSION      # Attach to the session"
 echo "  Ctrl-b n / Ctrl-b p          # Switch between windows"
 echo "  Ctrl-b 0-4                   # Jump to specific window"
 echo ""
-echo "  Logs:"
-echo "    /tmp/steward-leak-detector.log"
-echo "    /tmp/steward-ingress-sanitizer.log"
-echo "    /tmp/steward-audit-logger.log"
-echo "    /tmp/steward-permission-engine.log"
+echo "  Each window runs Claude Code interactively — watch live progress."
 echo ""
 echo "  When all tasks complete, check PRs:"
 echo "    gh pr list --repo ketani23/steward"
