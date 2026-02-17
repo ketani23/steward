@@ -52,19 +52,8 @@ for i in {1..${#BRANCHES[@]}}; do
   tmux new-window -t "$SESSION" -n "$branch"
 
   # Start claude interactively with restricted permissions (allow/deny from .claude/settings.json)
-  tmux send-keys -t "$SESSION:$branch" "cd $wt_dir && claude --permission-mode dontAsk" Enter
-
-  # Wait for claude to initialize
-  sleep 3
-
-  # Paste the task prompt into claude's input
-  # Use tmux load-buffer to handle the long prompt content
-  tmux load-buffer -b "task-${branch}" "${REPO_DIR}/docs/tasks/${task_file}"
-  tmux paste-buffer -b "task-${branch}" -t "$SESSION:$branch"
-
-  # Submit the prompt
-  sleep 1
-  tmux send-keys -t "$SESSION:$branch" Enter
+  # Send the initial prompt inline — Claude will read the task file itself
+  tmux send-keys -t "$SESSION:$branch" "cd $wt_dir && claude --permission-mode dontAsk 'Read the file docs/tasks/${task_file} and implement everything described in it. Follow all instructions in CLAUDE.md. When done, push your branch and create a PR.'" Enter
 
   echo "  Launched Claude Code for $task_file"
 done
