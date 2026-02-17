@@ -38,10 +38,5 @@
       "Bash(mkfs *)",
       "Bash(chmod 777 *)"
     ]
-  },
-  "sandbox": {
-    "enabled": true,
-    "autoAllowBashIfSandboxed": true,
-    "allowUnsandboxedCommands": false
   }
 }
