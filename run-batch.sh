@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/zsh
 # run-batch.sh — Launch parallel Claude Code instances for Batch 1
 #
 # Usage: ./run-batch.sh
@@ -11,13 +11,9 @@ set -euo pipefail
 REPO_DIR="$HOME/Projects/steward"
 SESSION="steward-batch1"
 
-# Batch 1 tasks: branch-name → task-file
-declare -A TASKS=(
-  ["leak-detector"]="TASK-1.1.md"
-  ["ingress-sanitizer"]="TASK-1.2.md"
-  ["audit-logger"]="TASK-1.3.md"
-  ["permission-engine"]="TASK-1.4.md"
-)
+# Batch 1 tasks (parallel arrays — compatible with macOS zsh/bash 3)
+BRANCHES=("leak-detector" "ingress-sanitizer" "audit-logger" "permission-engine")
+TASK_FILES=("TASK-1.1.md" "TASK-1.2.md" "TASK-1.3.md" "TASK-1.4.md")
 
 # Ensure we're on latest main
 cd "$REPO_DIR"
@@ -30,8 +26,9 @@ echo "Creating tmux session: $SESSION"
 tmux kill-session -t "$SESSION" 2>/dev/null || true
 tmux new-session -d -s "$SESSION" -n "overview"
 
-for branch in "${!TASKS[@]}"; do
-  task_file="${TASKS[$branch]}"
+for i in {1..${#BRANCHES[@]}}; do
+  branch="${BRANCHES[$i]}"
+  task_file="${TASK_FILES[$i]}"
   wt_dir="${REPO_DIR}-wt-${branch}"
   feat_branch="feat/${branch}"
 
