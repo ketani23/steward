@@ -1889,6 +1889,7 @@ name = "steward-security"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "chrono",
  "regex",
  "serde",
  "serde_json",
@@ -1896,6 +1897,7 @@ dependencies = [
  "steward-types",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
