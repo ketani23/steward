@@ -51,8 +51,8 @@ for i in {1..${#BRANCHES[@]}}; do
   echo "  Creating tmux window: $branch"
   tmux new-window -t "$SESSION" -n "$branch"
 
-  # Start claude interactively with --dangerously-skip-permissions
-  tmux send-keys -t "$SESSION:$branch" "cd $wt_dir && claude --dangerously-skip-permissions" Enter
+  # Start claude interactively with restricted permissions (allow/deny from .claude/settings.json)
+  tmux send-keys -t "$SESSION:$branch" "cd $wt_dir && claude --permission-mode dontAsk" Enter
 
   # Wait for claude to initialize
   sleep 3
