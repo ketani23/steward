@@ -29,13 +29,36 @@ pub struct PermissionTiers {
 }
 
 /// Configuration for a single permission tier.
-// TODO: Add constraints, confirmation, schedule
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TierConfig {
     /// Human-readable description of this tier.
     pub description: String,
     /// List of action patterns (supports wildcards like "email.*").
     pub actions: Vec<String>,
+    /// Optional constraints (rate limits, etc.).
+    #[serde(default)]
+    pub constraints: Option<TierConstraints>,
+    /// Optional confirmation config (for human_approval tier).
+    #[serde(default)]
+    pub confirmation: Option<ConfirmationConfig>,
+}
+
+/// Constraints that can be applied to a permission tier.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TierConstraints {
+    /// Rate limit in the format "N/period" (e.g., "60/minute", "10/second").
+    pub rate_limit: Option<String>,
+}
+
+/// Configuration for the human approval confirmation flow.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfirmationConfig {
+    /// Which channel to request confirmation through.
+    pub channel: Option<String>,
+    /// What information to show in the confirmation request.
+    pub show: Option<Vec<String>>,
+    /// Timeout for the confirmation request (e.g., "5m").
+    pub timeout: Option<String>,
 }
 
 /// Guardrails configuration, parsed from `config/guardrails.yaml`.
