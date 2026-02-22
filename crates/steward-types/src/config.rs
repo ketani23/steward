@@ -86,7 +86,7 @@ pub struct McpManifestConfig {
 }
 
 /// Configuration for a single MCP tool in a manifest.
-// TODO: Add schema_rewrites, rate_limit, permission_tier override
+// TODO: Add rate_limit, permission_tier override
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpToolConfig {
     /// Tool name.
@@ -97,6 +97,52 @@ pub struct McpToolConfig {
     pub rate_limit: Option<String>,
     /// Whether this tool requires human approval regardless of tier.
     pub requires_approval: Option<bool>,
+    /// Schema rewrite rules for this tool's input schema.
+    pub schema_rewrites: Option<SchemaRewriteConfig>,
+}
+
+/// Schema rewrite configuration for an MCP tool.
+///
+/// Used by the schema rewriter (architecture section 8.9) to strip blocked
+/// parameters and apply constraints to tool input schemas before the agent
+/// sees them. This is proactive defense — the agent cannot construct calls
+/// with blocked parameters because they are absent from the schema.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SchemaRewriteConfig {
+    /// Property names to remove from the schema's `properties` object.
+    /// Also removed from `required` if present.
+    #[serde(default)]
+    pub strip_params: Vec<String>,
+    /// Constraints to add or modify on existing properties.
+    /// Keys are property names, values describe the constraints.
+    #[serde(default)]
+    pub constrain_params: std::collections::HashMap<String, ParamConstraint>,
+}
+
+/// Constraints to apply to a JSON Schema property.
+///
+/// Each field maps to a JSON Schema keyword. Only non-None fields are
+/// applied to the property's schema object.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ParamConstraint {
+    /// Maximum numeric value (JSON Schema `maximum`).
+    pub maximum: Option<f64>,
+    /// Minimum numeric value (JSON Schema `minimum`).
+    pub minimum: Option<f64>,
+    /// Maximum string length (JSON Schema `maxLength`).
+    #[serde(rename = "maxLength")]
+    pub max_length: Option<u64>,
+    /// Minimum string length (JSON Schema `minLength`).
+    #[serde(rename = "minLength")]
+    pub min_length: Option<u64>,
+    /// Maximum array items (JSON Schema `maxItems`).
+    #[serde(rename = "maxItems")]
+    pub max_items: Option<u64>,
+    /// Minimum array items (JSON Schema `minItems`).
+    #[serde(rename = "minItems")]
+    pub min_items: Option<u64>,
+    /// Regex pattern for string validation (JSON Schema `pattern`).
+    pub pattern: Option<String>,
 }
 
 /// Agent identity configuration, parsed from `config/identity.md`.
