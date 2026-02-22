@@ -835,7 +835,6 @@ mod tests {
                 connected: Mutex::new(true),
             }
         }
-
     }
 
     #[async_trait]
