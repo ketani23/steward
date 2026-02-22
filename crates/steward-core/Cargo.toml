@@ -19,3 +19,5 @@ chrono.workspace = true
 chrono.workspace = true
 tempfile = "3"
 uuid.workspace = true
+wiremock = "0.6"
+tokio = { workspace = true, features = ["full"] }
