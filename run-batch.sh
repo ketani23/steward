@@ -34,6 +34,14 @@ case "$BATCH" in
     BRANCHES=("secret-broker" "llm-provider" "guardian" "config-management")
     TASK_FILES=("TASK-4.1.md" "TASK-4.2.md" "TASK-4.3.md" "TASK-4.4.md")
     ;;
+  5)
+    BRANCHES=("mcp-proxy-core" "agent-core" "tool-registry")
+    TASK_FILES=("TASK-5.1.md" "TASK-5.2.md" "TASK-5.3.md")
+    ;;
+  6)
+    BRANCHES=("whatsapp-channel" "e2e-smoke")
+    TASK_FILES=("TASK-6.1.md" "TASK-6.2.md")
+    ;;
   *)
     echo "Unknown batch: $BATCH"
     exit 1
