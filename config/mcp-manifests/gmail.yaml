@@ -1,0 +1,48 @@
+# Gmail MCP Server Capability Manifest
+# See docs/architecture.md section 8.3 for the manifest specification.
+
+server: gmail-mcp
+transport: stdio
+
+allowed_tools:
+  - name: gmail.search
+    allowed: true
+    rate_limit: 30/minute
+  - name: gmail.read
+    allowed: true
+    rate_limit: 60/minute
+  - name: gmail.send
+    allowed: true
+    requires_approval: true  # escalate to human via permission engine
+  - name: gmail.delete
+    allowed: false           # hard block — never permitted
+  - name: gmail.modify_labels
+    allowed: true
+    rate_limit: 10/minute
+
+blocked_params:
+  - "*.bcc"        # no hidden recipients
+  - "*.forward_to" # no auto-forwarding rules
+
+schema_rewrites:
+  gmail.send:
+    strip_params:
+      - bcc
+      - forward_to
+    constrain_params:
+      to:
+        max_recipients: 5        # Prevent mass-mailing
+      attachments:
+        max_size_bytes: 10485760 # 10MB limit
+  gmail.search:
+    constrain_params:
+      max_results:
+        maximum: 50              # Prevent context flooding
+
+circuit_breaker:
+  error_threshold: 5
+  error_window_secs: 60
+  latency_threshold_secs: 30
+  recovery_timeout_secs: 120
+  recovery_probes: 3
+  max_recovery_backoff_secs: 900
