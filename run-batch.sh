@@ -31,7 +31,7 @@ case "$BATCH" in
     TASK_FILES=("TASK-3.1.md" "TASK-3.2.md" "TASK-3.3.md" "TASK-3.4.md")
     ;;
   4)
-    BRANCHES=("secret-broker" "tool-registry" "mcp-proxy" "channel-manager")
+    BRANCHES=("secret-broker" "llm-provider" "guardian" "config-management")
     TASK_FILES=("TASK-4.1.md" "TASK-4.2.md" "TASK-4.3.md" "TASK-4.4.md")
     ;;
   *)
