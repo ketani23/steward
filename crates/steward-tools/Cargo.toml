@@ -15,5 +15,9 @@ tracing.workspace = true
 reqwest.workspace = true
 glob-match = "0.2"
 
+[dev-dependencies]
+axum.workspace = true
+tokio = { workspace = true, features = ["full"] }
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
