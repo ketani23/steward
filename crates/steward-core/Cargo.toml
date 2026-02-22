@@ -13,8 +13,11 @@ serde_json.workspace = true
 serde_yaml.workspace = true
 tracing.workspace = true
 reqwest.workspace = true
+chrono.workspace = true
 
 [dev-dependencies]
 chrono.workspace = true
 tempfile = "3"
 uuid.workspace = true
+wiremock = "0.6"
+tokio = { workspace = true, features = ["full"] }
