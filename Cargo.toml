@@ -41,10 +41,12 @@ hkdf = "0.12"
 sha2 = "0.10"
 
 # Utilities
+pgvector = { version = "0.4", features = ["sqlx"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 tracing = "0.1"
 regex = "1"
+notify = { version = "7", features = ["macos_fsevent"] }
 
 # Internal crates
 steward-types = { path = "crates/steward-types" }

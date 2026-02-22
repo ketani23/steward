@@ -9,6 +9,7 @@
 /// - **Worker**: Job execution with LLM reasoning and tool calls
 pub mod agent;
 pub mod guardian;
+pub mod llm;
 pub mod permissions;
 pub mod router;
 pub mod scheduler;
