@@ -145,6 +145,49 @@ pub struct ParamConstraint {
     pub pattern: Option<String>,
 }
 
+/// Per-server circuit breaker configuration, embedded in MCP manifest YAML.
+///
+/// Controls the state machine transitions: Closed → Open → HalfOpen.
+/// See `docs/architecture.md` section 8.11 for specification.
+///
+/// ```yaml
+/// circuit_breaker:
+///   error_threshold: 5
+///   error_window: 60s
+///   latency_threshold: 30s
+///   recovery_timeout: 120s
+///   recovery_probes: 3
+///   max_recovery_backoff: 15m
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CircuitBreakerConfig {
+    /// Consecutive errors within `error_window` before the circuit trips open.
+    pub error_threshold: u32,
+    /// Duration window for counting consecutive errors (in seconds).
+    pub error_window_secs: u64,
+    /// Maximum response time before a call counts as an error (in seconds).
+    pub latency_threshold_secs: u64,
+    /// Base duration to wait before attempting recovery probes (in seconds).
+    pub recovery_timeout_secs: u64,
+    /// Number of consecutive successful probes needed to close the circuit.
+    pub recovery_probes: u32,
+    /// Maximum backoff between retry attempts (in seconds).
+    pub max_recovery_backoff_secs: u64,
+}
+
+impl Default for CircuitBreakerConfig {
+    fn default() -> Self {
+        Self {
+            error_threshold: 5,
+            error_window_secs: 60,
+            latency_threshold_secs: 30,
+            recovery_timeout_secs: 120,
+            recovery_probes: 3,
+            max_recovery_backoff_secs: 900, // 15 minutes
+        }
+    }
+}
+
 /// Agent identity configuration, parsed from `config/identity.md`.
 // TODO: Parse from markdown with YAML frontmatter
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -521,6 +521,21 @@ pub enum CircuitState {
     HalfOpen,
 }
 
+/// Metrics snapshot from a circuit breaker instance.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CircuitBreakerMetrics {
+    /// Total number of recorded successes.
+    pub total_successes: u64,
+    /// Total number of recorded failures.
+    pub total_failures: u64,
+    /// Milliseconds spent in the current state.
+    pub time_in_current_state_ms: u64,
+    /// Number of times the circuit has tripped from Closed to Open.
+    pub trips_count: u64,
+    /// Current circuit state.
+    pub current_state: CircuitState,
+}
+
 // ============================================================
 // Channel Types
 // ============================================================
