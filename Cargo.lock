@@ -2225,6 +2225,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "steward-integration-tests"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "serde_json",
+ "steward-core",
+ "steward-security",
+ "steward-tools",
+ "steward-types",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "steward-memory"
 version = "0.1.0"
 dependencies = [
