@@ -13,3 +13,10 @@ serde_json.workspace = true
 tracing.workspace = true
 axum.workspace = true
 reqwest.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
