@@ -79,6 +79,29 @@ All configuration files live in the `config/` directory (override with `--config
 | `WHATSAPP_APP_SECRET` | App secret for webhook signature verification |
 | `WHATSAPP_VERIFY_TOKEN` | Webhook verification token |
 
+### Telegram Integration (Optional)
+
+| Variable | Description |
+|----------|-------------|
+| `TELEGRAM_BOT_TOKEN` | Bot token from [@BotFather](https://t.me/BotFather) |
+| `TELEGRAM_ALLOWED_USER_IDS` | Comma-delimited list of Telegram user IDs allowed to interact with the bot (deny-all if empty) |
+| `TELEGRAM_API_BASE_URL` | Telegram Bot API base URL (default: `https://api.telegram.org`) |
+
+To set up Telegram:
+
+1. Create a bot via [@BotFather](https://t.me/BotFather) and copy the bot token
+2. Send a message to your bot, then call `https://api.telegram.org/bot<TOKEN>/getUpdates` to find your user ID
+3. Run Steward with the Telegram env vars:
+
+```bash
+ANTHROPIC_API_KEY=sk-ant-... \
+TELEGRAM_BOT_TOKEN=123456:ABC-DEF... \
+TELEGRAM_ALLOWED_USER_IDS=your_user_id \
+./target/release/steward
+```
+
+The bot uses long-polling (`getUpdates`) — no webhook or public URL required.
+
 ## Docker Deployment
 
 ### Full stack with Docker Compose

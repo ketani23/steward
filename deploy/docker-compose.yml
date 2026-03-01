@@ -37,6 +37,10 @@ services:
       # WHATSAPP_PHONE_NUMBER_ID: ${WHATSAPP_PHONE_NUMBER_ID}
       # WHATSAPP_APP_SECRET: ${WHATSAPP_APP_SECRET}
       # WHATSAPP_VERIFY_TOKEN: ${WHATSAPP_VERIFY_TOKEN}
+      # Telegram (optional — set these to enable)
+      # TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      # TELEGRAM_ALLOWED_USER_IDS: ${TELEGRAM_ALLOWED_USER_IDS}
+      # TELEGRAM_API_BASE_URL: https://api.telegram.org
     depends_on:
       postgres:
         condition: service_healthy

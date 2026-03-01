@@ -6,6 +6,7 @@
 //! - Database connection + migrations
 //! - Component initialization (security, LLM, guardian, permissions, tools, memory, channels)
 //! - Webhook/HTTP server for inbound messages
+//! - Message processing loop (inbound → agent → outbound)
 //! - Graceful shutdown on SIGTERM/SIGINT
 
 use std::net::SocketAddr;
@@ -19,6 +20,8 @@ use tokio::signal;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
+use steward_channels::manager::ChannelManager;
+use steward_channels::telegram::{TelegramAdapter, TelegramConfig};
 use steward_channels::whatsapp::{WhatsAppAdapter, WhatsAppConfig};
 use steward_core::agent::{Agent, AgentConfig, AgentDeps};
 use steward_core::guardian::{GuardianConfig, GuardianLlm};
@@ -28,9 +31,10 @@ use steward_security::audit::{self, InMemoryAuditLogger, PostgresAuditLogger};
 use steward_security::egress::{EgressFilterConfig, EgressFilterImpl};
 use steward_security::ingress::{DefaultIngressSanitizer, IngressSanitizerConfig};
 use steward_security::leak_detector::PatternLeakDetector;
+use steward_tools::built_in::shell::{ShellConfig, ShellTool};
 use steward_tools::registry::ToolRegistryImpl;
-use steward_types::actions::InboundMessage;
-use steward_types::traits::AuditLogger;
+use steward_types::actions::{ChannelType, InboundMessage, OutboundMessage};
+use steward_types::traits::{AuditLogger, ChannelAdapter};
 
 /// Steward — security-hardened autonomous AI agent.
 #[derive(Parser, Debug)]
@@ -87,6 +91,22 @@ struct Cli {
     /// WhatsApp webhook verification token.
     #[arg(long, env = "WHATSAPP_VERIFY_TOKEN")]
     whatsapp_verify_token: Option<String>,
+
+    /// Telegram Bot API token (from BotFather).
+    #[arg(long, env = "TELEGRAM_BOT_TOKEN")]
+    telegram_bot_token: Option<String>,
+
+    /// Comma-delimited list of allowed Telegram user IDs.
+    #[arg(long, env = "TELEGRAM_ALLOWED_USER_IDS", value_delimiter = ',')]
+    telegram_allowed_user_ids: Option<Vec<i64>>,
+
+    /// Telegram Bot API base URL.
+    #[arg(
+        long,
+        default_value = "https://api.telegram.org",
+        env = "TELEGRAM_API_BASE_URL"
+    )]
+    telegram_api_base_url: String,
 
     /// Log format: "json" for structured JSON, "pretty" for human-readable.
     #[arg(long, default_value = "pretty", env = "STEWARD_LOG_FORMAT")]
@@ -171,8 +191,14 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         },
     ));
 
-    // ── 6. Tool registry ────────────────────────────────────────
+    // ── 6. Tool registry + shell tool ───────────────────────────
     let tools = Arc::new(ToolRegistryImpl::new());
+    tools
+        .register_built_in(
+            ShellTool::tool_definition(),
+            Arc::new(ShellTool::new(ShellConfig::default())),
+        )
+        .await?;
 
     // ── 7. Memory (requires DB) ─────────────────────────────────
     let memory: Arc<dyn steward_types::traits::MemorySearch> = if let Some(ref pool) = db_pool {
@@ -185,22 +211,58 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Arc::new(NullMemorySearch)
     };
 
-    // ── 8. Channel adapter ──────────────────────────────────────
-    let channel: Arc<dyn steward_types::traits::ChannelAdapter> =
-        if cli.whatsapp_access_token.is_some() {
-            info!("Configuring WhatsApp channel adapter");
-            let wa_config = WhatsAppConfig {
-                access_token: cli.whatsapp_access_token.clone().unwrap_or_default(),
-                phone_number_id: cli.whatsapp_phone_number_id.clone().unwrap_or_default(),
-                app_secret: cli.whatsapp_app_secret.clone().unwrap_or_default(),
-                verify_token: cli.whatsapp_verify_token.clone().unwrap_or_default(),
-                ..WhatsAppConfig::default()
-            };
-            Arc::new(WhatsAppAdapter::new(wa_config))
-        } else {
-            info!("No channel configured — using console channel for testing");
-            Arc::new(ConsoleChannel)
+    // ── 8. Channel manager ──────────────────────────────────────
+    // Create manager → register adapters → start_listening() → THEN wrap in Arc.
+    let mut channel_manager = ChannelManager::new(256);
+
+    let has_whatsapp = cli.whatsapp_access_token.is_some();
+    let has_telegram = cli.telegram_bot_token.is_some();
+
+    if has_whatsapp {
+        info!("Configuring WhatsApp channel adapter");
+        let wa_config = WhatsAppConfig {
+            access_token: cli.whatsapp_access_token.clone().unwrap_or_default(),
+            phone_number_id: cli.whatsapp_phone_number_id.clone().unwrap_or_default(),
+            app_secret: cli.whatsapp_app_secret.clone().unwrap_or_default(),
+            verify_token: cli.whatsapp_verify_token.clone().unwrap_or_default(),
+            ..WhatsAppConfig::default()
         };
+        channel_manager
+            .register_channel(
+                ChannelType::WhatsApp,
+                Arc::new(WhatsAppAdapter::new(wa_config)),
+            )
+            .await;
+    }
+
+    if has_telegram {
+        info!("Configuring Telegram channel adapter");
+        let tg_config = TelegramConfig {
+            bot_token: cli.telegram_bot_token.clone().unwrap_or_default(),
+            allowed_user_ids: cli.telegram_allowed_user_ids.clone().unwrap_or_default(),
+            api_base_url: cli.telegram_api_base_url.clone(),
+            ..TelegramConfig::default()
+        };
+        channel_manager
+            .register_channel(
+                ChannelType::Telegram,
+                Arc::new(TelegramAdapter::new(tg_config)),
+            )
+            .await;
+    }
+
+    if !has_whatsapp && !has_telegram {
+        info!("No channel configured — using console channel for testing");
+        channel_manager
+            .register_channel(ChannelType::WebChat, Arc::new(ConsoleChannel))
+            .await;
+    }
+
+    // Start listening on all registered channels BEFORE wrapping in Arc.
+    let inbound_rx = channel_manager.start_listening().await?;
+
+    // Now wrap the manager in Arc for shared ownership.
+    let channel: Arc<dyn ChannelAdapter> = Arc::new(channel_manager);
 
     // ── 9. Agent ────────────────────────────────────────────────
     let agent_config = AgentConfig {
@@ -220,9 +282,44 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         channel: channel.clone(),
     };
 
-    let _agent = Arc::new(Agent::new(deps, agent_config));
+    let agent = Arc::new(Agent::new(deps, agent_config));
 
-    // ── 10. HTTP server (webhook endpoints) ─────────────────────
+    // ── 10. Message processing loop ─────────────────────────────
+    let agent_loop = Arc::clone(&agent);
+    let channel_loop = channel.clone();
+    let msg_loop_handle = tokio::spawn(async move {
+        let mut rx = inbound_rx;
+        while let Some(msg) = rx.recv().await {
+            let sender = msg.sender.clone();
+            let ch = msg.channel;
+            match agent_loop.handle_message(msg).await {
+                Ok(text) => {
+                    let out = OutboundMessage {
+                        recipient: sender.clone(),
+                        text,
+                        channel: ch,
+                        metadata: serde_json::json!({}),
+                    };
+                    if let Err(e) = channel_loop.send_message(out).await {
+                        error!(sender = %sender, error = %e, "failed to send response");
+                    }
+                }
+                Err(e) => {
+                    error!(sender = %sender, error = %e, "agent handle_message failed");
+                    let out = OutboundMessage {
+                        recipient: sender.clone(),
+                        text: format!("Error: {e}"),
+                        channel: ch,
+                        metadata: serde_json::json!({}),
+                    };
+                    let _ = channel_loop.send_message(out).await;
+                }
+            }
+        }
+        info!("Message processing loop exited — inbound channel closed");
+    });
+
+    // ── 11. HTTP server (webhook endpoints) ─────────────────────
     let app = build_router();
 
     let addr: SocketAddr = format!("{}:{}", cli.host, cli.port).parse()?;
@@ -230,11 +327,19 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
 
-    // ── 11. Run server with graceful shutdown ───────────────────
+    // ── 12. Run server + message loop with graceful shutdown ────
     info!("Steward is ready. Send messages via the configured channel.");
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+
+    tokio::select! {
+        result = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal()) => {
+            if let Err(e) = result {
+                error!(error = %e, "HTTP server error");
+            }
+        }
+        _ = msg_loop_handle => {
+            info!("Message processing loop finished");
+        }
+    }
 
     info!("Steward server shut down gracefully");
     Ok(())
