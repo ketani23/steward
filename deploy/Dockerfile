@@ -14,14 +14,19 @@ FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /app/target/release/steward /usr/local/bin/steward
-COPY config/ /etc/steward/config/
+# Create non-root service user
+RUN groupadd --gid 10001 steward \
+    && useradd --uid 10001 --gid steward --shell /usr/sbin/nologin --no-create-home steward
 
-# TODO: Read-only root filesystem with ephemeral tmpfs at /tmp/workspace
-# TODO: Non-root user
-# TODO: Network egress allowlisting
+COPY --from=builder /app/target/release/steward /usr/local/bin/steward
+COPY --chown=steward:steward config/ /etc/steward/config/
+
+RUN mkdir -p /tmp/workspace && chown steward:steward /tmp/workspace
+
+USER steward
 
 EXPOSE 8080
 

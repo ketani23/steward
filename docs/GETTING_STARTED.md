@@ -121,6 +121,102 @@ docker compose up -d
 docker build -f deploy/Dockerfile -t steward:latest .
 ```
 
+## VPS Deployment (DigitalOcean)
+
+Run Steward 24/7 on a VPS, fully isolated from your local machine.
+
+### Prerequisites
+
+- A DigitalOcean droplet (or any Ubuntu 22.04+ VPS) with SSH access
+- Your Anthropic API key
+- (Optional) Telegram bot token and user IDs
+
+### Automated Setup with Claude Code
+
+The easiest way to set up a VPS is with the Claude Code prompt:
+
+1. SSH into your VPS
+2. Install Claude Code if not already available
+3. Open the prompt at [`deploy/VPS_SETUP_PROMPT.md`](../deploy/VPS_SETUP_PROMPT.md)
+4. Paste it into Claude Code — it will walk you through the full setup interactively
+
+### Manual Setup
+
+```bash
+# 1. Install Docker (if not installed)
+curl -fsSL https://get.docker.com | sh
+systemctl enable --now docker
+
+# 2. Create service user
+useradd --system --create-home --home-dir /opt/steward --shell /usr/sbin/nologin steward
+usermod -aG docker steward
+
+# 3. Clone and configure
+git clone https://github.com/<OWNER>/steward.git /opt/steward/steward
+cd /opt/steward/steward
+cp .env.example .env
+
+# 4. Edit .env — set your API keys, generate a Postgres password:
+#    openssl rand -base64 32
+chmod 600 .env
+chown steward:steward .env
+
+# 5. Firewall
+ufw allow 22/tcp
+ufw allow 8080/tcp
+ufw --force enable
+
+# 6. Build and start
+cd deploy
+docker compose up -d --build
+
+# 7. Verify
+docker compose ps
+curl http://localhost:8080/health
+```
+
+### Security Notes
+
+The production Docker setup includes several hardening measures:
+
+- **Non-root container:** Steward runs as UID 10001, not root
+- **Read-only filesystem:** The container root filesystem is mounted read-only; only `/tmp` and `/tmp/workspace` are writable (via tmpfs)
+- **Dropped capabilities:** All Linux capabilities are dropped (`cap_drop: ALL`)
+- **No privilege escalation:** `no-new-privileges` security option is set
+- **Network isolation:** PostgreSQL is only accessible within the Docker network — its port is not exposed to the host
+- **Secret management:** All secrets live in `.env` (chmod 600, owned by the service user) — never in docker-compose.yml
+
+### Useful Commands
+
+```bash
+cd /opt/steward/steward/deploy
+
+# View logs
+docker compose logs -f
+
+# Restart
+docker compose restart
+
+# Update to latest
+cd .. && git pull && cd deploy && docker compose up -d --build
+
+# Stop
+docker compose down
+
+# Check status
+docker compose ps
+```
+
+### Troubleshooting
+
+| Symptom | Fix |
+|---------|-----|
+| `POSTGRES_PASSWORD not set` | Ensure `.env` exists and has `POSTGRES_PASSWORD` set |
+| Health check failing | Check logs: `docker compose logs steward` |
+| Permission denied on `.env` | `chmod 600 .env && chown steward:steward .env` |
+| Port 8080 unreachable | Check firewall: `ufw status` |
+| Container keeps restarting | Check logs for startup errors: `docker compose logs --tail=50 steward` |
+
 ## Architecture
 
 Steward processes messages through a security pipeline:
