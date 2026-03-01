@@ -44,7 +44,7 @@ CREATE INDEX IF NOT EXISTS idx_audit_events_event_type_timestamp ON audit_events
 
 /// Run the audit logger migrations against the given pool.
 pub async fn run_migrations(pool: &PgPool) -> Result<(), StewardError> {
-    sqlx::query(CREATE_AUDIT_EVENTS_TABLE)
+    sqlx::raw_sql(CREATE_AUDIT_EVENTS_TABLE)
         .execute(pool)
         .await
         .map_err(|e| StewardError::Database(format!("failed to run audit migrations: {e}")))?;
