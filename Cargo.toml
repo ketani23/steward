@@ -7,6 +7,7 @@ members = [
     "crates/steward-tools",
     "crates/steward-core",
     "crates/steward-channels",
+    "crates/steward-server",
     "tests/integration",
 ]
 
@@ -57,3 +58,4 @@ steward-memory = { path = "crates/steward-memory" }
 steward-tools = { path = "crates/steward-tools" }
 steward-core = { path = "crates/steward-core" }
 steward-channels = { path = "crates/steward-channels" }
+steward-server = { path = "crates/steward-server" }
