@@ -108,6 +108,12 @@ pub struct GuardrailsConfig {
     /// Ingress sanitizer configuration.
     #[serde(default)]
     pub ingress: Option<IngressConfig>,
+    /// Trusted sender IDs exempt from `[EXTERNAL_CONTENT]` tagging in ingress.
+    ///
+    /// Messages from these senders are still injection-scanned but are not wrapped
+    /// in hostile-source delimiters. Typically your own Telegram/WhatsApp user ID(s).
+    #[serde(default)]
+    pub trusted_senders: Vec<String>,
 }
 
 /// Egress filter configuration from guardrails.
