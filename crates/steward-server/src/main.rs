@@ -34,6 +34,8 @@ use steward_security::leak_detector::PatternLeakDetector;
 use steward_tools::built_in::shell::{ShellConfig, ShellTool};
 use steward_tools::registry::ToolRegistryImpl;
 use steward_types::actions::{ChannelType, InboundMessage, OutboundMessage};
+use steward_types::config::IdentityConfig;
+use steward_types::config_loader::ConfigLoader;
 use steward_types::traits::{AuditLogger, ChannelAdapter};
 
 /// Steward — security-hardened autonomous AI agent.
@@ -129,6 +131,21 @@ async fn main() {
 }
 
 async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
+    // ── 0. Load config (identity, guardrails, permissions) ──────
+    let steward_config = ConfigLoader::load_all(&cli.config_dir).map_err(|e| {
+        format!(
+            "Failed to load config from {}: {e}",
+            cli.config_dir.display()
+        )
+    })?;
+    let system_prompt = build_system_prompt(&steward_config.identity);
+    let trusted_senders = steward_config.guardrails.trusted_senders.clone();
+    info!(
+        identity = %steward_config.identity.name,
+        trusted_sender_count = trusted_senders.len(),
+        "Loaded agent identity and config"
+    );
+
     // ── 1. Database (optional) ──────────────────────────────────
     let db_pool = if let Some(ref url) = cli.database_url {
         info!("Connecting to PostgreSQL...");
@@ -144,9 +161,10 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // ── 2. Security components ──────────────────────────────────
     let leak_detector = Arc::new(PatternLeakDetector::new());
 
-    let ingress = Arc::new(DefaultIngressSanitizer::new(
-        IngressSanitizerConfig::default(),
-    ));
+    let ingress = Arc::new(DefaultIngressSanitizer::new(IngressSanitizerConfig {
+        trusted_senders,
+        ..IngressSanitizerConfig::default()
+    }));
 
     let egress = Arc::new(
         EgressFilterImpl::new(leak_detector.clone(), EgressFilterConfig::default())
@@ -267,6 +285,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // ── 9. Agent ────────────────────────────────────────────────
     let agent_config = AgentConfig {
         model: cli.model.clone(),
+        system_prompt,
         ..AgentConfig::default()
     };
 
@@ -411,6 +430,21 @@ fn init_tracing(format: &str) {
             tracing_subscriber::fmt().with_env_filter(filter).init();
         }
     }
+}
+
+/// Build the system prompt from the agent's identity config.
+///
+/// Combines the raw identity markdown with brief tool-use guidance.
+/// Falls back gracefully if the identity markdown is empty.
+fn build_system_prompt(identity: &IdentityConfig) -> String {
+    let identity_md = identity.raw_markdown.trim();
+    if identity_md.is_empty() {
+        return AgentConfig::default().system_prompt;
+    }
+    format!(
+        "{identity_md}\n\n---\n\nWhen using tools, briefly describe what you're about to do. \
+         Work through multi-step tasks one step at a time."
+    )
 }
 
 // ═══════════════════════════════════════════════════════════════
