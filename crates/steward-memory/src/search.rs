@@ -25,10 +25,26 @@ use steward_types::traits::MemorySearch;
 // SQL Migrations
 // ============================================================
 
+/// SQL migration to enable the pgvector extension.
+const EXTENSION_MIGRATION: &str = "CREATE EXTENSION IF NOT EXISTS vector";
+
+/// SQL migration to create the `memories` table.
+///
+/// This is the primary store queried by hybrid search.
+const MEMORIES_TABLE_MIGRATION: &str = "\
+CREATE TABLE IF NOT EXISTS memories (\
+    id UUID PRIMARY KEY, \
+    content TEXT NOT NULL, \
+    provenance TEXT NOT NULL DEFAULT 'agent_observation', \
+    trust_score DOUBLE PRECISION NOT NULL DEFAULT 0.5, \
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), \
+    embedding vector(1536)\
+)";
+
 /// SQL migrations for the search module.
 ///
 /// Creates indexes needed for hybrid search. The `memories` table itself
-/// is created by the workspace module — this only adds search-specific indexes.
+/// is created by `run_migrations` before these indexes are applied.
 pub const SEARCH_MIGRATIONS: &str = "\
 CREATE INDEX IF NOT EXISTS idx_memories_fts \
 ON memories USING GIN (to_tsvector('english', content));\
@@ -289,10 +305,24 @@ impl HybridMemorySearch {
         }
     }
 
-    /// Run search-specific database migrations (indexes).
+    /// Run all search-related database migrations.
     ///
-    /// Should be called after the workspace module has created the memories table.
+    /// Creates the pgvector extension, the `memories` table, and the FTS and
+    /// HNSW indexes. Safe to call on every startup — all statements use
+    /// `IF NOT EXISTS`.
     pub async fn run_migrations(&self) -> Result<(), StewardError> {
+        sqlx::query(EXTENSION_MIGRATION)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| {
+                StewardError::Database(format!("vector extension migration failed: {e}"))
+            })?;
+
+        sqlx::query(MEMORIES_TABLE_MIGRATION)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StewardError::Database(format!("memories table migration failed: {e}")))?;
+
         sqlx::query(SEARCH_MIGRATIONS)
             .execute(&self.pool)
             .await
@@ -303,7 +333,7 @@ impl HybridMemorySearch {
             .await
             .map_err(|e| StewardError::Database(format!("vector index migration failed: {e}")))?;
 
-        tracing::info!("search indexes created successfully");
+        tracing::info!("memories table and search indexes created successfully");
         Ok(())
     }
 

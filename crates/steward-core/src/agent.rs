@@ -22,6 +22,7 @@ use steward_types::config::{KnownAgentConfig, OwnerConfig};
 use steward_types::errors::StewardError;
 use steward_types::traits::*;
 
+use crate::conversation::ConversationStore;
 use crate::router::{MessageIntent, MessageRouter};
 
 /// Maximum number of tool-use turns before the agent stops.
@@ -91,13 +92,15 @@ pub struct AgentDeps {
     pub memory: Arc<dyn MemorySearch>,
     /// Channel adapter for sending messages and approval requests.
     pub channel: Arc<dyn ChannelAdapter>,
+    /// Conversation history store for multi-turn sessions.
+    pub conversation_store: Arc<ConversationStore>,
 }
 
 /// The main agent orchestrator.
 ///
 /// Wires together all subsystems (LLM, Guardian, Permissions, Tools, Egress,
-/// Ingress, Audit, Memory) and drives the request pipeline. All dependencies
-/// are injected as trait objects for testability.
+/// Ingress, Audit, Memory, Conversation) and drives the request pipeline. All
+/// dependencies are injected as trait objects for testability.
 pub struct Agent {
     llm: Arc<dyn LlmProvider>,
     guardian: Arc<dyn Guardian>,
@@ -108,6 +111,7 @@ pub struct Agent {
     audit: Arc<dyn AuditLogger>,
     memory: Arc<dyn MemorySearch>,
     channel: Arc<dyn ChannelAdapter>,
+    conversation_store: Arc<ConversationStore>,
     router: MessageRouter,
     config: AgentConfig,
 }
@@ -125,6 +129,7 @@ impl Agent {
             audit: deps.audit,
             memory: deps.memory,
             channel: deps.channel,
+            conversation_store: deps.conversation_store,
             router: MessageRouter::new(),
             config,
         }
@@ -146,6 +151,9 @@ impl Agent {
     pub async fn handle_message(&self, message: InboundMessage) -> Result<String, StewardError> {
         let message_id = message.id;
 
+        // Derive session key for conversation history.
+        let session_key = format!("{:?}:{}", message.channel, message.sender);
+
         // Step 1: Ingress sanitization
         let sanitized = self.sanitize_input(&message).await?;
 
@@ -166,11 +174,12 @@ impl Agent {
             MessageIntent::Conversation => vec![],
         };
 
-        let user_prompt = self.build_user_prompt(&sanitized.text, &context, &message);
-        let mut conversation = vec![ChatMessage {
+        // Prepend conversation history before the current user message.
+        let mut conversation = self.conversation_store.get_history(&session_key);
+        conversation.push(ChatMessage {
             role: ChatRole::User,
-            content: user_prompt,
-        }];
+            content: self.build_user_prompt(&sanitized.text, &context, &message),
+        });
 
         let system_prompt = self.build_system_prompt(&message);
         let mut final_response = String::new();
@@ -312,6 +321,13 @@ impl Agent {
                 tracing::error!(error = %e, "Egress filter error");
             }
         }
+
+        // Store this turn in conversation history so the next message has context.
+        self.conversation_store.store_turn(
+            &session_key,
+            message.text.clone(),
+            final_response.clone(),
+        );
 
         Ok(final_response)
     }
@@ -1358,6 +1374,7 @@ mod tests {
             audit,
             memory: Arc::new(MockMemory),
             channel: Arc::new(MockChannel::approving()),
+            conversation_store: Arc::new(ConversationStore::new()),
         }
     }
 
@@ -2094,5 +2111,141 @@ mod tests {
             !system.contains("group chat"),
             "DM should not have group chat guidance: {system}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_conversation_history_stored_after_turn() {
+        let store = Arc::new(ConversationStore::new());
+        let llm = Arc::new(MockLlm::new(vec![MockLlm::text_response("First reply")]));
+        let audit = Arc::new(MockAudit::new());
+        let mut deps = default_deps(llm, audit);
+        deps.conversation_store = Arc::clone(&store);
+        let agent = build_agent(deps);
+
+        agent
+            .handle_message(test_message("First question"))
+            .await
+            .unwrap();
+
+        // After one turn, the session should hold the user + assistant messages.
+        let history = store.get_history("WhatsApp:user@test.com");
+        assert_eq!(
+            history.len(),
+            2,
+            "Expected 2 messages (user + assistant) in history"
+        );
+        assert_eq!(history[0].role, ChatRole::User);
+        assert_eq!(history[0].content, "First question");
+        assert_eq!(history[1].role, ChatRole::Assistant);
+        assert_eq!(history[1].content, "First reply");
+    }
+
+    #[tokio::test]
+    async fn test_conversation_history_injected_into_second_call() {
+        let store = Arc::new(ConversationStore::new());
+
+        // First call.
+        {
+            let llm = Arc::new(MockLlm::new(vec![MockLlm::text_response("First reply")]));
+            let audit = Arc::new(MockAudit::new());
+            let mut deps = default_deps(llm, audit);
+            deps.conversation_store = Arc::clone(&store);
+            let agent = build_agent(deps);
+            agent
+                .handle_message(test_message("First question"))
+                .await
+                .unwrap();
+        }
+
+        // Second call — capture the LLM request to verify history is prepended.
+        let captured_messages = Arc::new(std::sync::Mutex::new(vec![]));
+
+        struct CapturingLlm {
+            captured: Arc<std::sync::Mutex<Vec<Vec<ChatMessage>>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl LlmProvider for CapturingLlm {
+            async fn complete(
+                &self,
+                request: CompletionRequest,
+            ) -> Result<CompletionResponse, StewardError> {
+                self.captured.lock().unwrap().push(request.messages.clone());
+                Ok(CompletionResponse {
+                    content: "Second reply".to_string(),
+                    tool_calls: vec![],
+                    model: "mock".to_string(),
+                    usage: TokenUsage {
+                        input_tokens: 10,
+                        output_tokens: 5,
+                    },
+                })
+            }
+
+            async fn complete_with_tools(
+                &self,
+                request: CompletionRequest,
+                _tools: &[ToolDefinition],
+            ) -> Result<CompletionResponse, StewardError> {
+                self.complete(request).await
+            }
+        }
+
+        let llm2 = Arc::new(CapturingLlm {
+            captured: Arc::clone(&captured_messages),
+        });
+        let audit = Arc::new(MockAudit::new());
+        let mut deps = default_deps(llm2, audit);
+        deps.conversation_store = Arc::clone(&store);
+        let agent = build_agent(deps);
+        agent
+            .handle_message(test_message("Second question"))
+            .await
+            .unwrap();
+
+        let captured = captured_messages.lock().unwrap();
+        assert!(!captured.is_empty(), "LLM should have been called");
+        let messages = &captured[0];
+        // Messages should be: [history_user, history_assistant, current_user]
+        assert!(
+            messages.len() >= 3,
+            "Expected at least 3 messages (history + current), got {}",
+            messages.len()
+        );
+        assert_eq!(messages[0].role, ChatRole::User);
+        assert_eq!(messages[0].content, "First question");
+        assert_eq!(messages[1].role, ChatRole::Assistant);
+        assert_eq!(messages[1].content, "First reply");
+        // Last message is the current user turn.
+        assert_eq!(messages.last().unwrap().role, ChatRole::User);
+    }
+
+    #[tokio::test]
+    async fn test_conversation_history_isolated_by_session() {
+        let store = Arc::new(ConversationStore::new());
+        let llm = Arc::new(MockLlm::new(vec![
+            MockLlm::text_response("Reply to alice"),
+            MockLlm::text_response("Reply to bob"),
+        ]));
+        let audit = Arc::new(MockAudit::new());
+        let mut deps = default_deps(llm, audit);
+        deps.conversation_store = Arc::clone(&store);
+        let agent = build_agent(deps);
+
+        let mut alice_msg = test_message("Alice's message");
+        alice_msg.sender = "alice".to_string();
+        let mut bob_msg = test_message("Bob's message");
+        bob_msg.sender = "bob".to_string();
+
+        agent.handle_message(alice_msg).await.unwrap();
+        agent.handle_message(bob_msg).await.unwrap();
+
+        let alice_history = store.get_history("WhatsApp:alice");
+        let bob_history = store.get_history("WhatsApp:bob");
+
+        assert_eq!(alice_history.len(), 2);
+        assert_eq!(bob_history.len(), 2);
+        assert_eq!(alice_history[0].content, "Alice's message");
+        assert_eq!(bob_history[0].content, "Bob's message");
     }
 }

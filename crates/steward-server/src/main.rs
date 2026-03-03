@@ -28,6 +28,7 @@ use steward_channels::manager::ChannelManager;
 use steward_channels::telegram::{TelegramAdapter, TelegramConfig};
 use steward_channels::whatsapp::{WhatsAppAdapter, WhatsAppConfig};
 use steward_core::agent::{Agent, AgentConfig, AgentDeps};
+use steward_core::conversation::ConversationStore;
 use steward_core::guardian::{GuardianConfig, GuardianLlm};
 use steward_core::llm::anthropic::AnthropicProvider;
 use steward_core::permissions::YamlPermissionEngine;
@@ -250,11 +251,17 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
     // ── 7. Memory (requires DB) ─────────────────────────────────
     let memory: Arc<dyn steward_types::traits::MemorySearch> = if let Some(ref pool) = db_pool {
-        Arc::new(steward_memory::search::HybridMemorySearch::new(
+        let search = steward_memory::search::HybridMemorySearch::new(
             pool.clone(),
             steward_memory::search::SearchConfig::default(),
             None, // No embedding provider yet — FTS only
-        ))
+        );
+        search
+            .run_migrations()
+            .await
+            .map_err(|e| format!("Memory migration failed: {e}"))?;
+        info!("Memory table and indexes ready");
+        Arc::new(search)
     } else {
         Arc::new(NullMemorySearch)
     };
@@ -331,6 +338,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         audit: audit.clone(),
         memory,
         channel: channel.clone(),
+        conversation_store: Arc::new(ConversationStore::new()),
     };
 
     let agent = Arc::new(Agent::new(deps, agent_config));
@@ -867,6 +875,7 @@ mod tests {
                 audit: Arc::new(MockAudit),
                 memory: Arc::new(MockMemory),
                 channel: Arc::new(MockChannel),
+                conversation_store: Arc::new(ConversationStore::new()),
             },
             AgentConfig::default(),
         ));
