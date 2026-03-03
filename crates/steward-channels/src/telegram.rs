@@ -692,6 +692,39 @@ impl TelegramPollingWorker {
         }
     }
 
+    /// Acknowledge a callback query to dismiss the loading spinner in Telegram.
+    ///
+    /// This is a fire-and-forget call — failures are logged as warnings but
+    /// do not affect the approval flow.
+    async fn answer_callback_query(&self, callback_query_id: &str) {
+        let body = serde_json::json!({
+            "callback_query_id": callback_query_id,
+        });
+
+        match self
+            .client
+            .post(self.config.api_url("answerCallbackQuery"))
+            .json(&body)
+            .send()
+            .await
+        {
+            Ok(resp) if !resp.status().is_success() => {
+                let status = resp.status();
+                tracing::warn!(
+                    callback_query_id = %callback_query_id,
+                    "answerCallbackQuery returned non-success status {status}"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    callback_query_id = %callback_query_id,
+                    "answerCallbackQuery request failed: {e}"
+                );
+            }
+            Ok(_) => {}
+        }
+    }
+
     /// Handle a callback query (inline keyboard button press).
     async fn handle_callback_query(&self, cq: &CallbackQuery) {
         if !self.allowed_user_ids.contains(&cq.from.id) {
@@ -702,16 +735,15 @@ impl TelegramPollingWorker {
             return;
         }
 
-        // We intentionally do NOT call answerCallbackQuery from the polling worker
-        // to keep the worker simple and avoid needing the rate limiter here.
-        // The main adapter's handle_callback_query calls it when invoked directly.
-        // For the polling path, the loading spinner will timeout on its own — a
-        // minor UX trade-off for architectural simplicity. In production, consider
-        // calling answerCallbackQuery here too.
+        // Always acknowledge the callback query so the loading spinner is dismissed.
+        self.answer_callback_query(&cq.id).await;
 
         let data = match &cq.data {
             Some(d) => d.as_str(),
-            None => return,
+            None => {
+                tracing::debug!(callback_id = %cq.id, "Callback query has no data");
+                return;
+            }
         };
 
         let (approved, approval_id) = if let Some(id) = data.strip_prefix("approve_") {
@@ -719,14 +751,27 @@ impl TelegramPollingWorker {
         } else if let Some(id) = data.strip_prefix("reject_") {
             (false, id)
         } else {
+            tracing::debug!(data = %data, "Ignoring callback query with unrecognized data format");
             return;
         };
+
+        tracing::info!(
+            approval_id = %approval_id,
+            approved = %approved,
+            user_id = %cq.from.id,
+            "Received approval callback"
+        );
 
         let approvals = self.pending_approvals.read().await;
         if let Some(tx) = approvals.get(approval_id) {
             if let Err(e) = tx.send(approved).await {
-                tracing::error!("Failed to send approval response: {e}");
+                tracing::error!(approval_id = %approval_id, "Failed to deliver approval response: {e}");
             }
+        } else {
+            tracing::warn!(
+                approval_id = %approval_id,
+                "No pending approval found — it may have already timed out or been resolved"
+            );
         }
     }
 }
