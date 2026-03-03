@@ -119,6 +119,13 @@ struct Cli {
     #[arg(long, default_value = "pretty", env = "STEWARD_LOG_FORMAT")]
     log_format: String,
 
+    /// Comma-separated list of trusted sender IDs that bypass `[EXTERNAL_CONTENT]` tagging.
+    ///
+    /// Takes priority over `TELEGRAM_ALLOWED_USER_IDS` as a source of trusted senders.
+    /// Merged with any `trusted_senders` entries already present in `guardrails.yaml`.
+    #[arg(long, env = "STEWARD_TRUSTED_SENDERS", value_delimiter = ',')]
+    trusted_senders: Option<Vec<String>>,
+
     /// Bearer token that callers must supply in `Authorization: Bearer <key>`
     /// when calling `POST /chat`. **Required** — if unset, all requests to
     /// `POST /chat` are rejected with `401 Unauthorized`.
@@ -150,7 +157,27 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         )
     })?;
     let system_prompt = build_system_prompt(&steward_config.identity);
-    let trusted_senders = steward_config.guardrails.trusted_senders.clone();
+    // Build the trusted-senders list from three sources (in priority order):
+    //   1. guardrails.yaml `trusted_senders`
+    //   2. STEWARD_TRUSTED_SENDERS env var (explicit override)
+    //   3. TELEGRAM_ALLOWED_USER_IDS as a fallback (owner's Telegram ID should be trusted)
+    let mut trusted_senders = steward_config.guardrails.trusted_senders.clone();
+
+    if let Some(ref env_senders) = cli.trusted_senders {
+        for s in env_senders {
+            if !trusted_senders.contains(s) {
+                trusted_senders.push(s.clone());
+            }
+        }
+    } else if let Some(ref tg_ids) = cli.telegram_allowed_user_ids {
+        for id in tg_ids {
+            let id_str = id.to_string();
+            if !trusted_senders.contains(&id_str) {
+                trusted_senders.push(id_str);
+            }
+        }
+    }
+
     info!(
         identity = %steward_config.identity.name,
         trusted_sender_count = trusted_senders.len(),
@@ -338,7 +365,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     error!(sender = %sender, error = %e, "agent handle_message failed");
                     let out = OutboundMessage {
                         recipient: sender.clone(),
-                        text: format!("Error: {e}"),
+                        text: "Sorry, I'm having trouble processing that right now. Please try again in a moment.".to_string(),
                         channel: ch,
                         metadata: serde_json::json!({}),
                     };

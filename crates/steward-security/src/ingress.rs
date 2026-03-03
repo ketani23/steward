@@ -352,8 +352,11 @@ impl IngressSanitizer for DefaultIngressSanitizer {
         // 3. Escape dangerous characters and normalize whitespace
         let escaped = self.escape_content(&text);
 
-        // 4. Wrap in content tags — skipped for trusted senders.
-        let final_text = if is_trusted {
+        // 4. Wrap in content tags — skipped for trusted senders or empty content.
+        //    Empty/whitespace-only content is not wrapped so the LLM never sees bare
+        //    `[EXTERNAL_CONTENT]` tags without meaningful payload, which could otherwise
+        //    surface internal markup in responses to trivial/empty messages.
+        let final_text = if is_trusted || escaped.trim().is_empty() {
             escaped
         } else {
             Self::tag_content(&escaped, &input.source, input.sender.as_deref())
@@ -932,10 +935,10 @@ mod tests {
         let sanitizer = make_sanitizer();
         let input = raw("", "email", None);
         let result = sanitizer.sanitize(input).await.unwrap();
-        assert_eq!(
-            result.text,
-            r#"[EXTERNAL_CONTENT source="email"][/EXTERNAL_CONTENT]"#
-        );
+        // Empty content must NOT be wrapped in [EXTERNAL_CONTENT] tags so the LLM
+        // never sees bare markup in responses to empty/trivial messages.
+        assert_eq!(result.text, "");
+        assert!(!result.text.contains("[EXTERNAL_CONTENT"));
         assert!(result.detections.is_empty());
         assert!(!result.truncated);
     }
