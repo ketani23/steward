@@ -18,6 +18,7 @@ use chrono::Utc;
 use uuid::Uuid;
 
 use steward_types::actions::*;
+use steward_types::config::{KnownAgentConfig, OwnerConfig};
 use steward_types::errors::StewardError;
 use steward_types::traits::*;
 
@@ -42,6 +43,15 @@ pub struct AgentConfig {
     pub max_tool_turns: usize,
     /// System prompt for the primary LLM.
     pub system_prompt: String,
+    /// Owner configuration for identity-aware responses.
+    ///
+    /// When set, the agent identifies messages from the owner and injects trust context.
+    pub owner: Option<OwnerConfig>,
+    /// Known peer agents for peer identification.
+    ///
+    /// When a message sender matches a known agent's `sender_id`, the agent is informed
+    /// it is communicating with a peer AI assistant.
+    pub known_agents: Vec<KnownAgentConfig>,
 }
 
 impl Default for AgentConfig {
@@ -52,6 +62,8 @@ impl Default for AgentConfig {
             temperature: Some(0.7),
             max_tool_turns: MAX_TOOL_TURNS,
             system_prompt: default_system_prompt(),
+            owner: None,
+            known_agents: vec![],
         }
     }
 }
@@ -154,17 +166,19 @@ impl Agent {
             MessageIntent::Conversation => vec![],
         };
 
+        let user_prompt = self.build_user_prompt(&sanitized.text, &context, &message);
         let mut conversation = vec![ChatMessage {
             role: ChatRole::User,
-            content: self.build_user_prompt(&sanitized.text, &context),
+            content: user_prompt,
         }];
 
+        let system_prompt = self.build_system_prompt(&message);
         let mut final_response = String::new();
 
         // Multi-turn tool use loop
         for turn in 0..self.config.max_tool_turns {
             let request = CompletionRequest {
-                system: self.config.system_prompt.clone(),
+                system: system_prompt.clone(),
                 messages: conversation.clone(),
                 model: self.config.model.clone(),
                 max_tokens: self.config.max_tokens,
@@ -582,20 +596,102 @@ impl Agent {
         }
     }
 
-    /// Build the user prompt with sanitized text and memory context.
-    fn build_user_prompt(&self, sanitized_text: &str, context: &[MemorySearchResult]) -> String {
-        if context.is_empty() {
-            return sanitized_text.to_string();
+    /// Build the system prompt, appending group-chat guidance when relevant.
+    ///
+    /// For group chat messages, a note is appended so the agent doesn't assume
+    /// every message is directed at it.
+    fn build_system_prompt(&self, message: &InboundMessage) -> String {
+        let mut prompt = self.config.system_prompt.clone();
+
+        let chat_type = message
+            .metadata
+            .get("chat_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        if matches!(chat_type, "group" | "supergroup") {
+            prompt.push_str(
+                "\n\nYou are in a group chat. Not every message is directed at you. \
+                 Respond when addressed or when you can clearly add value.",
+            );
         }
 
-        let context_text: String = context
-            .iter()
-            .enumerate()
-            .map(|(i, r)| format!("[Context {}] {}", i + 1, r.entry.content))
-            .collect::<Vec<_>>()
-            .join("\n");
+        prompt
+    }
 
-        format!("Relevant context:\n{context_text}\n\nUser message:\n{sanitized_text}")
+    /// Build the user prompt with sanitized text, memory context, and sender identity tags.
+    ///
+    /// Prepends:
+    /// - `[Message from your owner, <name>]` when the sender matches the configured owner.
+    /// - `[Message from peer AI agent: <name>]` when the sender matches a known agent.
+    /// - `[Group chat message from <name> (ID: <id>)]` when the chat is a group.
+    fn build_user_prompt(
+        &self,
+        sanitized_text: &str,
+        context: &[MemorySearchResult],
+        message: &InboundMessage,
+    ) -> String {
+        let mut prefix_parts: Vec<String> = Vec::new();
+
+        // Identify the sender
+        if let Some(ref owner) = self.config.owner {
+            let is_owner = owner
+                .telegram_id
+                .as_deref()
+                .is_some_and(|id| id == message.sender);
+            if is_owner {
+                prefix_parts.push(format!("[Message from your owner, {}]", owner.name));
+            }
+        }
+
+        if prefix_parts.is_empty() {
+            for agent in &self.config.known_agents {
+                if agent.sender_id == message.sender {
+                    prefix_parts.push(format!(
+                        "[Message from peer AI agent: {} — {}]",
+                        agent.name, agent.description
+                    ));
+                    break;
+                }
+            }
+        }
+
+        // Add group chat context if applicable
+        let chat_type = message
+            .metadata
+            .get("chat_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        if matches!(chat_type, "group" | "supergroup") {
+            let sender_name = message
+                .metadata
+                .get("sender_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or(&message.sender);
+            prefix_parts.push(format!(
+                "[Group chat message from {} (ID: {})]",
+                sender_name, message.sender
+            ));
+        }
+
+        let base = if context.is_empty() {
+            sanitized_text.to_string()
+        } else {
+            let context_text: String = context
+                .iter()
+                .enumerate()
+                .map(|(i, r)| format!("[Context {}] {}", i + 1, r.entry.content))
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!("Relevant context:\n{context_text}\n\nUser message:\n{sanitized_text}")
+        };
+
+        if prefix_parts.is_empty() {
+            base
+        } else {
+            format!("{}\n{}", prefix_parts.join("\n"), base)
+        }
     }
 
     // ---- Audit logging helpers ----
@@ -1706,7 +1802,8 @@ mod tests {
         let deps = default_deps(Arc::new(MockLlm::new(vec![])), Arc::new(MockAudit::new()));
         let agent = build_agent(deps);
 
-        let prompt = agent.build_user_prompt("Hello there", &[]);
+        let msg = test_message("Hello there");
+        let prompt = agent.build_user_prompt("Hello there", &[], &msg);
         assert_eq!(prompt, "Hello there");
     }
 
@@ -1729,7 +1826,8 @@ mod tests {
             vector_rank: None,
         }];
 
-        let prompt = agent.build_user_prompt("What do I like?", &context);
+        let msg = test_message("What do I like?");
+        let prompt = agent.build_user_prompt("What do I like?", &context, &msg);
         assert!(prompt.contains("Relevant context:"));
         assert!(prompt.contains("User likes coffee"));
         assert!(prompt.contains("What do I like?"));
@@ -1765,5 +1863,125 @@ mod tests {
         assert_eq!(config.max_tokens, 4096);
         assert_eq!(config.max_tool_turns, MAX_TOOL_TURNS);
         assert!(config.system_prompt.contains("Steward"));
+        assert!(config.owner.is_none());
+        assert!(config.known_agents.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_owner_message_gets_tagged() {
+        use steward_types::config::OwnerConfig;
+
+        let deps = default_deps(Arc::new(MockLlm::new(vec![])), Arc::new(MockAudit::new()));
+        let mut config = AgentConfig::default();
+        config.owner = Some(OwnerConfig {
+            name: "Aniket".to_string(),
+            telegram_id: Some("1430891255".to_string()),
+        });
+        let agent = Agent::new(deps, config);
+
+        let mut msg = test_message("Hello");
+        msg.sender = "1430891255".to_string();
+
+        let prompt = agent.build_user_prompt("Hello", &[], &msg);
+        assert!(
+            prompt.contains("[Message from your owner, Aniket]"),
+            "Expected owner tag, got: {prompt}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_non_owner_sender_not_tagged_as_owner() {
+        use steward_types::config::OwnerConfig;
+
+        let deps = default_deps(Arc::new(MockLlm::new(vec![])), Arc::new(MockAudit::new()));
+        let mut config = AgentConfig::default();
+        config.owner = Some(OwnerConfig {
+            name: "Aniket".to_string(),
+            telegram_id: Some("1430891255".to_string()),
+        });
+        let agent = Agent::new(deps, config);
+
+        let mut msg = test_message("Hello");
+        msg.sender = "9999999".to_string();
+
+        let prompt = agent.build_user_prompt("Hello", &[], &msg);
+        assert!(
+            !prompt.contains("[Message from your owner"),
+            "Non-owner should not be tagged as owner: {prompt}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_known_agent_message_gets_tagged() {
+        use steward_types::config::KnownAgentConfig;
+
+        let deps = default_deps(Arc::new(MockLlm::new(vec![])), Arc::new(MockAudit::new()));
+        let mut config = AgentConfig::default();
+        config.known_agents = vec![KnownAgentConfig {
+            name: "Rook".to_string(),
+            description: "AI assistant running on OpenClaw".to_string(),
+            sender_id: "rook_agent".to_string(),
+        }];
+        let agent = Agent::new(deps, config);
+
+        let mut msg = test_message("Hey");
+        msg.sender = "rook_agent".to_string();
+
+        let prompt = agent.build_user_prompt("Hey", &[], &msg);
+        assert!(
+            prompt.contains("[Message from peer AI agent: Rook"),
+            "Expected peer agent tag, got: {prompt}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_group_chat_message_tagged_with_sender() {
+        let deps = default_deps(Arc::new(MockLlm::new(vec![])), Arc::new(MockAudit::new()));
+        let agent = build_agent(deps);
+
+        let mut msg = test_message("Anyone know the answer?");
+        msg.sender = "42".to_string();
+        msg.metadata = serde_json::json!({
+            "chat_type": "group",
+            "sender_name": "Alice"
+        });
+
+        let prompt = agent.build_user_prompt("Anyone know the answer?", &[], &msg);
+        assert!(
+            prompt.contains("[Group chat message from Alice (ID: 42)]"),
+            "Expected group chat tag, got: {prompt}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_group_chat_system_prompt_addition() {
+        let deps = default_deps(Arc::new(MockLlm::new(vec![])), Arc::new(MockAudit::new()));
+        let agent = build_agent(deps);
+
+        let mut msg = test_message("Hi");
+        msg.metadata = serde_json::json!({"chat_type": "supergroup"});
+
+        let system = agent.build_system_prompt(&msg);
+        assert!(
+            system.contains("group chat"),
+            "Expected group chat guidance in system prompt, got: {system}"
+        );
+        assert!(
+            system.contains("Not every message is directed at you"),
+            "Expected group chat directive, got: {system}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_non_group_chat_no_system_prompt_addition() {
+        let deps = default_deps(Arc::new(MockLlm::new(vec![])), Arc::new(MockAudit::new()));
+        let agent = build_agent(deps);
+
+        let msg = test_message("Just a normal DM");
+        let system = agent.build_system_prompt(&msg);
+        assert!(
+            !system.contains("group chat"),
+            "DM should not have group chat guidance: {system}"
+        );
     }
 }
