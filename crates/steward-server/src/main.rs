@@ -120,7 +120,8 @@ struct Cli {
     log_format: String,
 
     /// Bearer token that callers must supply in `Authorization: Bearer <key>`
-    /// when calling `POST /chat`. If unset, the endpoint accepts all requests.
+    /// when calling `POST /chat`. **Required** — if unset, all requests to
+    /// `POST /chat` are rejected with `401 Unauthorized`.
     #[arg(long, env = "STEWARD_API_KEY")]
     api_key: Option<String>,
 }
@@ -422,32 +423,53 @@ struct ChatResponse {
 /// runs it through the full agent pipeline, and returns the reply.
 ///
 /// # Auth
-/// If `STEWARD_API_KEY` is configured the caller must include:
+/// `STEWARD_API_KEY` must be set. The caller must include:
 /// `Authorization: Bearer <api_key>`
-/// Requests with missing or incorrect tokens receive `401 Unauthorized`.
+/// Requests with a missing, incorrect, or unconfigured key receive `401 Unauthorized`.
 async fn chat_handler(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     Json(req): Json<ChatRequest>,
 ) -> impl IntoResponse {
-    // ── Auth check ───────────────────────────────────────────
-    if let Some(ref expected) = state.api_key {
-        let token = headers
-            .get("Authorization")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "));
-        if token != Some(expected.as_str()) {
+    // ── Auth check (fail-closed) ─────────────────────────────
+    match &state.api_key {
+        None => {
             return (
                 StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({"error": "Unauthorized"})),
+                Json(serde_json::json!({"error": "STEWARD_API_KEY not configured"})),
             )
                 .into_response();
+        }
+        Some(expected) => {
+            let token = headers
+                .get("Authorization")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.strip_prefix("Bearer "));
+            if token != Some(expected.as_str()) {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Json(serde_json::json!({"error": "Unauthorized"})),
+                )
+                    .into_response();
+            }
         }
     }
 
     // ── Build InboundMessage ─────────────────────────────────
     let msg_id = Uuid::new_v4();
+
+    // Validate metadata: must be a JSON object (or absent).
     let mut meta = req.metadata;
+    if meta.is_null() {
+        meta = serde_json::json!({});
+    } else if !meta.is_object() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "metadata must be a JSON object"})),
+        )
+            .into_response();
+    }
+
     if let Some(name) = req.sender_name {
         meta["sender_name"] = serde_json::Value::String(name);
     }
@@ -475,7 +497,7 @@ async fn chat_handler(
             error!(error = %e, "chat handler: agent.handle_message failed");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": e.to_string()})),
+                Json(serde_json::json!({"error": "Internal server error"})),
             )
                 .into_response()
         }
@@ -861,19 +883,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_chat_200_when_no_api_key_configured() {
+    async fn test_chat_401_when_no_api_key_configured() {
+        // Endpoint is fail-closed: no key configured → every request is rejected.
         let app = build_router(make_test_state(None));
         let resp = app.oneshot(chat_post(r#"{"text":"hello"}"#)).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
     async fn test_chat_400_on_missing_text_field() {
-        let app = build_router(make_test_state(None));
+        let app = build_router(make_test_state(Some("secret".to_string())));
         let resp = app
-            .oneshot(chat_post(r#"{"sender_id":"rook"}"#))
+            .oneshot(chat_post_with_token(r#"{"sender_id":"rook"}"#, "secret"))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn test_chat_400_on_non_object_metadata_string() {
+        let app = build_router(make_test_state(Some("secret".to_string())));
+        let resp = app
+            .oneshot(chat_post_with_token(
+                r#"{"text":"hello","metadata":"bad"}"#,
+                "secret",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_chat_400_on_non_object_metadata_array() {
+        let app = build_router(make_test_state(Some("secret".to_string())));
+        let resp = app
+            .oneshot(chat_post_with_token(
+                r#"{"text":"hello","metadata":[1,2,3]}"#,
+                "secret",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 }
