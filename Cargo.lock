@@ -2428,6 +2428,7 @@ dependencies = [
  "steward-tools",
  "steward-types",
  "tokio",
+ "tower",
  "tracing",
  "tracing-subscriber",
  "uuid",

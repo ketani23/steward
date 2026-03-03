@@ -27,3 +27,6 @@ sqlx.workspace = true
 uuid.workspace = true
 chrono.workspace = true
 clap = { version = "4", features = ["derive", "env"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
