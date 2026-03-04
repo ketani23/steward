@@ -12,6 +12,7 @@ use chrono::Utc;
 use uuid::Uuid;
 
 use steward_core::agent::{Agent, AgentConfig, AgentDeps};
+use steward_core::conversation::ConversationStore;
 use steward_security::audit::InMemoryAuditLogger;
 use steward_security::egress::{EgressFilterConfig, EgressFilterImpl};
 use steward_security::ingress::{DefaultIngressSanitizer, IngressSanitizerConfig};
@@ -248,6 +249,7 @@ async fn build_smoke_agent(llm_responses: Vec<CompletionResponse>) -> (Agent, In
         audit: Arc::new(audit.clone()),
         memory: Arc::new(MockMemory),
         channel: Arc::new(MockChannel),
+        conversation_store: Arc::new(ConversationStore::new()),
     };
 
     let agent = Agent::new(deps, AgentConfig::default());

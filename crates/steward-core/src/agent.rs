@@ -22,6 +22,7 @@ use steward_types::config::{KnownAgentConfig, OwnerConfig};
 use steward_types::errors::StewardError;
 use steward_types::traits::*;
 
+use crate::conversation::ConversationStore;
 use crate::router::{MessageIntent, MessageRouter};
 
 /// Maximum number of tool-use turns before the agent stops.
@@ -91,13 +92,15 @@ pub struct AgentDeps {
     pub memory: Arc<dyn MemorySearch>,
     /// Channel adapter for sending messages and approval requests.
     pub channel: Arc<dyn ChannelAdapter>,
+    /// Conversation history store for multi-turn sessions.
+    pub conversation_store: Arc<ConversationStore>,
 }
 
 /// The main agent orchestrator.
 ///
 /// Wires together all subsystems (LLM, Guardian, Permissions, Tools, Egress,
-/// Ingress, Audit, Memory) and drives the request pipeline. All dependencies
-/// are injected as trait objects for testability.
+/// Ingress, Audit, Memory, Conversation) and drives the request pipeline. All
+/// dependencies are injected as trait objects for testability.
 pub struct Agent {
     llm: Arc<dyn LlmProvider>,
     guardian: Arc<dyn Guardian>,
@@ -108,6 +111,7 @@ pub struct Agent {
     audit: Arc<dyn AuditLogger>,
     memory: Arc<dyn MemorySearch>,
     channel: Arc<dyn ChannelAdapter>,
+    conversation_store: Arc<ConversationStore>,
     router: MessageRouter,
     config: AgentConfig,
 }
@@ -125,6 +129,7 @@ impl Agent {
             audit: deps.audit,
             memory: deps.memory,
             channel: deps.channel,
+            conversation_store: deps.conversation_store,
             router: MessageRouter::new(),
             config,
         }
@@ -146,6 +151,21 @@ impl Agent {
     pub async fn handle_message(&self, message: InboundMessage) -> Result<String, StewardError> {
         let message_id = message.id;
 
+        // Derive session key for conversation history.
+        //
+        // Security: the key must be based on server-controlled identifiers, not
+        // caller-supplied data, to prevent session hijacking.
+        //
+        // - Telegram: use `telegram_chat_id` from message metadata, which is set by
+        //   the Telegram adapter from the server-verified update object — not spoofable
+        //   by a message sender.
+        // - WebChat (/chat API): prefix with "api:" and append the caller-supplied
+        //   sender_id.  All /chat callers authenticate with the same API key and
+        //   therefore share a trust boundary; spoofing within that boundary is
+        //   acceptable for now.
+        // - Other channels (WhatsApp, etc.): fall back to channel + sender.
+        let session_key = derive_session_key(&message);
+
         // Step 1: Ingress sanitization
         let sanitized = self.sanitize_input(&message).await?;
 
@@ -166,11 +186,12 @@ impl Agent {
             MessageIntent::Conversation => vec![],
         };
 
-        let user_prompt = self.build_user_prompt(&sanitized.text, &context, &message);
-        let mut conversation = vec![ChatMessage {
+        // Prepend conversation history before the current user message.
+        let mut conversation = self.conversation_store.get_history(&session_key);
+        conversation.push(ChatMessage {
             role: ChatRole::User,
-            content: user_prompt,
-        }];
+            content: self.build_user_prompt(&sanitized.text, &context, &message),
+        });
 
         let system_prompt = self.build_system_prompt(&message);
         let mut final_response = String::new();
@@ -312,6 +333,14 @@ impl Agent {
                 tracing::error!(error = %e, "Egress filter error");
             }
         }
+
+        // Store this turn in conversation history so the next message has context.
+        // Use sanitized text to prevent injection replay through stored history.
+        self.conversation_store.store_turn(
+            &session_key,
+            sanitized.text.clone(),
+            final_response.clone(),
+        );
 
         Ok(final_response)
     }
@@ -854,6 +883,54 @@ enum ActionResult {
     Error(String),
 }
 
+/// Derive a session key for conversation history from an inbound message.
+///
+/// Uses server-controlled identifiers wherever available to prevent session
+/// hijacking by a malicious caller who supplies a spoofed `sender` field.
+///
+/// - **Telegram**: keyed on `telegram_chat_id` from adapter-set metadata.
+/// - **WebChat** (`/chat` API): keyed on `api:{principal}:{session_id}` where
+///   both `api_principal` and `api_session_id` are stamped by the auth handler
+///   from the verified API key — not caller-supplied. Falls back to
+///   `api:{principal}:{sender}` if no session_id is present, and to
+///   `api:{sender}` if no principal metadata is present either.
+/// - **Other channels**: `"<channel>:<sender>"` fallback.
+fn derive_session_key(message: &InboundMessage) -> String {
+    match message.channel {
+        ChannelType::Telegram => {
+            // telegram_chat_id is set by the TelegramAdapter from the server-verified
+            // update object — it cannot be forged by a message sender.
+            let chat_id = message
+                .metadata
+                .get("telegram_chat_id")
+                .and_then(|v| v.as_i64())
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| message.sender.clone());
+            format!("telegram:{chat_id}")
+        }
+        ChannelType::WebChat => {
+            // api_principal and api_session_id are stamped by the chat_handler auth
+            // layer — they are server-controlled and cannot be forged by the caller.
+            // This ensures each API key principal has an isolated session namespace.
+            let principal = message
+                .metadata
+                .get("api_principal")
+                .and_then(|v| v.as_str())
+                .unwrap_or("default");
+            if let Some(sid) = message
+                .metadata
+                .get("api_session_id")
+                .and_then(|v| v.as_str())
+            {
+                format!("api:{principal}:{sid}")
+            } else {
+                format!("api:{principal}:{}", message.sender)
+            }
+        }
+        _ => format!("{:?}:{}", message.channel, message.sender),
+    }
+}
+
 /// Sanitize a sender display name before injecting it into prompts.
 ///
 /// Strips control characters (including newlines) that could be used for prompt injection,
@@ -1184,6 +1261,31 @@ mod tests {
         }
     }
 
+    /// Ingress sanitizer that replaces the input text with a fixed sanitized value.
+    /// Used to verify that the sanitized text (not the raw input) is stored.
+    struct MockSanitizingIngress {
+        sanitized_text: String,
+    }
+
+    #[async_trait::async_trait]
+    impl IngressSanitizer for MockSanitizingIngress {
+        async fn sanitize(&self, input: RawContent) -> Result<SanitizedContent, StewardError> {
+            Ok(SanitizedContent {
+                text: self.sanitized_text.clone(),
+                detections: vec![],
+                truncated: true,
+                source: input.source,
+            })
+        }
+
+        async fn detect_injection(
+            &self,
+            _input: &str,
+        ) -> Result<Vec<InjectionDetection>, StewardError> {
+            Ok(vec![])
+        }
+    }
+
     struct MockIngressWithDetections;
 
     #[async_trait::async_trait]
@@ -1358,6 +1460,7 @@ mod tests {
             audit,
             memory: Arc::new(MockMemory),
             channel: Arc::new(MockChannel::approving()),
+            conversation_store: Arc::new(ConversationStore::new()),
         }
     }
 
@@ -2093,6 +2196,313 @@ mod tests {
         assert!(
             !system.contains("group chat"),
             "DM should not have group chat guidance: {system}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_conversation_history_stored_after_turn() {
+        let store = Arc::new(ConversationStore::new());
+        let llm = Arc::new(MockLlm::new(vec![MockLlm::text_response("First reply")]));
+        let audit = Arc::new(MockAudit::new());
+        let mut deps = default_deps(llm, audit);
+        deps.conversation_store = Arc::clone(&store);
+        let agent = build_agent(deps);
+
+        agent
+            .handle_message(test_message("First question"))
+            .await
+            .unwrap();
+
+        // After one turn, the session should hold the user + assistant messages.
+        let history = store.get_history("WhatsApp:user@test.com");
+        assert_eq!(
+            history.len(),
+            2,
+            "Expected 2 messages (user + assistant) in history"
+        );
+        assert_eq!(history[0].role, ChatRole::User);
+        assert_eq!(history[0].content, "First question");
+        assert_eq!(history[1].role, ChatRole::Assistant);
+        assert_eq!(history[1].content, "First reply");
+    }
+
+    #[tokio::test]
+    async fn test_conversation_history_injected_into_second_call() {
+        let store = Arc::new(ConversationStore::new());
+
+        // First call.
+        {
+            let llm = Arc::new(MockLlm::new(vec![MockLlm::text_response("First reply")]));
+            let audit = Arc::new(MockAudit::new());
+            let mut deps = default_deps(llm, audit);
+            deps.conversation_store = Arc::clone(&store);
+            let agent = build_agent(deps);
+            agent
+                .handle_message(test_message("First question"))
+                .await
+                .unwrap();
+        }
+
+        // Second call — capture the LLM request to verify history is prepended.
+        let captured_messages = Arc::new(std::sync::Mutex::new(vec![]));
+
+        struct CapturingLlm {
+            captured: Arc<std::sync::Mutex<Vec<Vec<ChatMessage>>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl LlmProvider for CapturingLlm {
+            async fn complete(
+                &self,
+                request: CompletionRequest,
+            ) -> Result<CompletionResponse, StewardError> {
+                self.captured.lock().unwrap().push(request.messages.clone());
+                Ok(CompletionResponse {
+                    content: "Second reply".to_string(),
+                    tool_calls: vec![],
+                    model: "mock".to_string(),
+                    usage: TokenUsage {
+                        input_tokens: 10,
+                        output_tokens: 5,
+                    },
+                })
+            }
+
+            async fn complete_with_tools(
+                &self,
+                request: CompletionRequest,
+                _tools: &[ToolDefinition],
+            ) -> Result<CompletionResponse, StewardError> {
+                self.complete(request).await
+            }
+        }
+
+        let llm2 = Arc::new(CapturingLlm {
+            captured: Arc::clone(&captured_messages),
+        });
+        let audit = Arc::new(MockAudit::new());
+        let mut deps = default_deps(llm2, audit);
+        deps.conversation_store = Arc::clone(&store);
+        let agent = build_agent(deps);
+        agent
+            .handle_message(test_message("Second question"))
+            .await
+            .unwrap();
+
+        let captured = captured_messages.lock().unwrap();
+        assert!(!captured.is_empty(), "LLM should have been called");
+        let messages = &captured[0];
+        // Messages should be: [history_user, history_assistant, current_user]
+        assert!(
+            messages.len() >= 3,
+            "Expected at least 3 messages (history + current), got {}",
+            messages.len()
+        );
+        assert_eq!(messages[0].role, ChatRole::User);
+        assert_eq!(messages[0].content, "First question");
+        assert_eq!(messages[1].role, ChatRole::Assistant);
+        assert_eq!(messages[1].content, "First reply");
+        // Last message is the current user turn.
+        assert_eq!(messages.last().unwrap().role, ChatRole::User);
+    }
+
+    #[tokio::test]
+    async fn test_conversation_history_isolated_by_session() {
+        let store = Arc::new(ConversationStore::new());
+        let llm = Arc::new(MockLlm::new(vec![
+            MockLlm::text_response("Reply to alice"),
+            MockLlm::text_response("Reply to bob"),
+        ]));
+        let audit = Arc::new(MockAudit::new());
+        let mut deps = default_deps(llm, audit);
+        deps.conversation_store = Arc::clone(&store);
+        let agent = build_agent(deps);
+
+        let mut alice_msg = test_message("Alice's message");
+        alice_msg.sender = "alice".to_string();
+        let mut bob_msg = test_message("Bob's message");
+        bob_msg.sender = "bob".to_string();
+
+        agent.handle_message(alice_msg).await.unwrap();
+        agent.handle_message(bob_msg).await.unwrap();
+
+        let alice_history = store.get_history("WhatsApp:alice");
+        let bob_history = store.get_history("WhatsApp:bob");
+
+        assert_eq!(alice_history.len(), 2);
+        assert_eq!(bob_history.len(), 2);
+        assert_eq!(alice_history[0].content, "Alice's message");
+        assert_eq!(bob_history[0].content, "Bob's message");
+    }
+
+    #[tokio::test]
+    async fn test_conversation_history_stores_sanitized_text() {
+        // Verify that the sanitized text (not the raw input) is stored in history,
+        // preventing injection replay through conversation context.
+        let store = Arc::new(ConversationStore::new());
+        let llm = Arc::new(MockLlm::new(vec![MockLlm::text_response("reply")]));
+        let audit = Arc::new(MockAudit::new());
+        let mut deps = default_deps(llm, audit);
+        deps.conversation_store = Arc::clone(&store);
+        deps.ingress = Arc::new(MockSanitizingIngress {
+            sanitized_text: "[SANITIZED]".to_string(),
+        });
+        let agent = build_agent(deps);
+
+        agent
+            .handle_message(test_message("raw injection payload"))
+            .await
+            .unwrap();
+
+        let history = store.get_history("WhatsApp:user@test.com");
+        assert_eq!(history.len(), 2);
+        // The stored user message must be the sanitized version, not the raw input.
+        assert_eq!(
+            history[0].content, "[SANITIZED]",
+            "History should store sanitized text, not raw input"
+        );
+        assert_ne!(
+            history[0].content, "raw injection payload",
+            "Raw input must not be stored in history"
+        );
+    }
+
+    // ── Session key security tests ───────────────────────────────
+
+    #[test]
+    fn test_session_key_telegram_uses_chat_id_from_metadata() {
+        let mut msg = test_message("hello");
+        msg.channel = ChannelType::Telegram;
+        msg.sender = "spoofed_sender".to_string();
+        msg.metadata = serde_json::json!({"telegram_chat_id": 12345_i64});
+
+        let key = derive_session_key(&msg);
+        assert_eq!(
+            key, "telegram:12345",
+            "Telegram key must use server-set chat_id"
+        );
+        assert!(
+            !key.contains("spoofed_sender"),
+            "Telegram key must not use caller-supplied sender"
+        );
+    }
+
+    #[test]
+    fn test_session_key_telegram_falls_back_to_sender_if_no_chat_id() {
+        let mut msg = test_message("hello");
+        msg.channel = ChannelType::Telegram;
+        msg.sender = "99999".to_string();
+        msg.metadata = serde_json::json!({});
+
+        let key = derive_session_key(&msg);
+        assert_eq!(key, "telegram:99999");
+    }
+
+    #[test]
+    fn test_session_key_webchat_with_principal_and_session_id() {
+        let mut msg = test_message("hello");
+        msg.channel = ChannelType::WebChat;
+        msg.sender = "user1".to_string();
+        msg.metadata = serde_json::json!({"api_principal": "rook", "api_session_id": "sess-abc"});
+
+        let key = derive_session_key(&msg);
+        assert_eq!(key, "api:rook:sess-abc");
+    }
+
+    #[test]
+    fn test_session_key_webchat_falls_back_to_principal_and_sender_without_session_id() {
+        let mut msg = test_message("hello");
+        msg.channel = ChannelType::WebChat;
+        msg.sender = "user1".to_string();
+        msg.metadata = serde_json::json!({"api_principal": "rook"});
+
+        let key = derive_session_key(&msg);
+        assert_eq!(key, "api:rook:user1");
+    }
+
+    #[test]
+    fn test_session_key_webchat_falls_back_to_default_principal_without_metadata() {
+        // No api_principal or api_session_id — e.g. messages from the channel loop.
+        let mut msg = test_message("hello");
+        msg.channel = ChannelType::WebChat;
+        msg.sender = "user1".to_string();
+        msg.metadata = serde_json::json!({});
+
+        let key = derive_session_key(&msg);
+        assert_eq!(key, "api:default:user1");
+    }
+
+    #[test]
+    fn test_session_key_whatsapp_uses_channel_sender_fallback() {
+        let mut msg = test_message("hello");
+        msg.channel = ChannelType::WhatsApp;
+        msg.sender = "15551234".to_string();
+
+        let key = derive_session_key(&msg);
+        assert_eq!(key, "WhatsApp:15551234");
+    }
+
+    #[test]
+    fn test_session_key_telegram_different_chat_ids_are_isolated() {
+        let mut msg_a = test_message("hello");
+        msg_a.channel = ChannelType::Telegram;
+        msg_a.sender = "same_user".to_string();
+        msg_a.metadata = serde_json::json!({"telegram_chat_id": 111_i64});
+
+        let mut msg_b = test_message("hello");
+        msg_b.channel = ChannelType::Telegram;
+        msg_b.sender = "same_user".to_string();
+        msg_b.metadata = serde_json::json!({"telegram_chat_id": 222_i64});
+
+        assert_ne!(
+            derive_session_key(&msg_a),
+            derive_session_key(&msg_b),
+            "Different telegram_chat_ids must produce different session keys"
+        );
+    }
+
+    #[test]
+    fn test_session_key_webchat_different_principals_same_session_id_are_isolated() {
+        // Two callers with different API keys (principals) but sharing the same
+        // session_id must land in different session buckets.
+        let mut msg_rook = test_message("hello");
+        msg_rook.channel = ChannelType::WebChat;
+        msg_rook.sender = "alice".to_string();
+        msg_rook.metadata =
+            serde_json::json!({"api_principal": "rook", "api_session_id": "shared-sid"});
+
+        let mut msg_aniket = test_message("hello");
+        msg_aniket.channel = ChannelType::WebChat;
+        msg_aniket.sender = "alice".to_string();
+        msg_aniket.metadata =
+            serde_json::json!({"api_principal": "aniket", "api_session_id": "shared-sid"});
+
+        assert_ne!(
+            derive_session_key(&msg_rook),
+            derive_session_key(&msg_aniket),
+            "Same session_id across different principals must not share a session"
+        );
+    }
+
+    #[test]
+    fn test_session_key_webchat_same_principal_same_session_id_share_session() {
+        // Same principal + same session_id → same session key (multi-turn continuity).
+        let mut msg1 = test_message("turn 1");
+        msg1.channel = ChannelType::WebChat;
+        msg1.sender = "alice".to_string();
+        msg1.metadata =
+            serde_json::json!({"api_principal": "rook", "api_session_id": "my-session"});
+
+        let mut msg2 = test_message("turn 2");
+        msg2.channel = ChannelType::WebChat;
+        msg2.sender = "alice".to_string();
+        msg2.metadata =
+            serde_json::json!({"api_principal": "rook", "api_session_id": "my-session"});
+
+        assert_eq!(
+            derive_session_key(&msg1),
+            derive_session_key(&msg2),
+            "Same principal + session_id must produce the same session key"
         );
     }
 }
