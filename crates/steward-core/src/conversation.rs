@@ -16,6 +16,10 @@ const MAX_HISTORY: usize = 20;
 /// How long a session can be idle before it is considered expired.
 const SESSION_TTL: Duration = Duration::from_secs(3600);
 
+/// Maximum number of concurrent sessions. When exceeded, the oldest session
+/// (by `last_activity`) is evicted to bound memory usage and prevent DoS.
+const MAX_SESSIONS: usize = 1000;
+
 /// A single conversation session.
 struct Session {
     /// Ordered list of messages (oldest first).
@@ -77,7 +81,9 @@ impl ConversationStore {
     ///
     /// Creates the session if it does not exist. Trims to the last
     /// [`MAX_HISTORY`] messages. Expired sessions are garbage-collected
-    /// on each call to this method.
+    /// on each call to this method. If the store would exceed [`MAX_SESSIONS`]
+    /// after cleanup, the oldest session (by `last_activity`) is evicted to
+    /// prevent unbounded memory growth (memory DoS).
     pub fn store_turn(&self, key: &str, user_message: String, assistant_reply: String) {
         let mut sessions = match self.sessions.write() {
             Ok(s) => s,
@@ -89,6 +95,23 @@ impl ConversationStore {
 
         // Lazy cleanup: remove expired sessions on every write.
         sessions.retain(|_, v| !v.is_expired());
+
+        // Cap total session count: evict the least-recently-active session when
+        // we would exceed MAX_SESSIONS and the key is not already present.
+        if sessions.len() >= MAX_SESSIONS && !sessions.contains_key(key) {
+            if let Some(oldest_key) = sessions
+                .iter()
+                .min_by_key(|(_, v)| v.last_activity)
+                .map(|(k, _)| k.clone())
+            {
+                sessions.remove(&oldest_key);
+                tracing::warn!(
+                    evicted_key = %oldest_key,
+                    max_sessions = MAX_SESSIONS,
+                    "Session cap reached — evicted oldest session"
+                );
+            }
+        }
 
         let session = sessions.entry(key.to_string()).or_insert_with(Session::new);
         session.last_activity = Instant::now();
@@ -199,5 +222,66 @@ mod tests {
         store.store_turn("webchat:alice", "Hello".to_string(), "Hi".to_string());
         // Different channel key → should get nothing.
         assert!(store.get_history("telegram:alice").is_empty());
+    }
+
+    #[test]
+    fn test_session_cap_evicts_oldest_on_overflow() {
+        let store = make_store();
+
+        // Fill up to MAX_SESSIONS.
+        for i in 0..MAX_SESSIONS {
+            store.store_turn(
+                &format!("session:{i}"),
+                format!("msg {i}"),
+                format!("reply {i}"),
+            );
+        }
+
+        // At MAX_SESSIONS, adding a new key should evict the oldest.
+        store.store_turn(
+            "session:new",
+            "new msg".to_string(),
+            "new reply".to_string(),
+        );
+
+        // The new session must exist.
+        assert!(!store.get_history("session:new").is_empty());
+
+        // Total session count must not exceed MAX_SESSIONS.
+        let count = store.sessions.read().unwrap().len();
+        assert!(
+            count <= MAX_SESSIONS,
+            "Session count {count} exceeds MAX_SESSIONS {MAX_SESSIONS}"
+        );
+    }
+
+    #[test]
+    fn test_existing_session_not_evicted_on_update() {
+        let store = make_store();
+
+        // Fill to MAX_SESSIONS-1 other sessions, then add "session:keep" as the
+        // MAX_SESSIONS-th entry so it is present when we update it.
+        for i in 0..(MAX_SESSIONS - 1) {
+            store.store_turn(
+                &format!("other:{i}"),
+                format!("msg {i}"),
+                format!("reply {i}"),
+            );
+        }
+        store.store_turn("session:keep", "initial".to_string(), "ok".to_string());
+
+        // Store is now at capacity. Updating an existing key must not trigger
+        // eviction (the cap guard only runs when the key is new).
+        store.store_turn(
+            "session:keep",
+            "follow-up".to_string(),
+            "got it".to_string(),
+        );
+        let history = store.get_history("session:keep");
+        assert_eq!(
+            history.len(),
+            4,
+            "Existing session should still have its messages"
+        );
     }
 }

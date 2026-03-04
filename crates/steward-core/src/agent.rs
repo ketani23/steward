@@ -152,7 +152,19 @@ impl Agent {
         let message_id = message.id;
 
         // Derive session key for conversation history.
-        let session_key = format!("{:?}:{}", message.channel, message.sender);
+        //
+        // Security: the key must be based on server-controlled identifiers, not
+        // caller-supplied data, to prevent session hijacking.
+        //
+        // - Telegram: use `telegram_chat_id` from message metadata, which is set by
+        //   the Telegram adapter from the server-verified update object — not spoofable
+        //   by a message sender.
+        // - WebChat (/chat API): prefix with "api:" and append the caller-supplied
+        //   sender_id.  All /chat callers authenticate with the same API key and
+        //   therefore share a trust boundary; spoofing within that boundary is
+        //   acceptable for now.
+        // - Other channels (WhatsApp, etc.): fall back to channel + sender.
+        let session_key = derive_session_key(&message);
 
         // Step 1: Ingress sanitization
         let sanitized = self.sanitize_input(&message).await?;
@@ -869,6 +881,38 @@ enum ActionResult {
     PendingApproval(bool, Option<ToolResult>),
     /// An error occurred during processing.
     Error(String),
+}
+
+/// Derive a session key for conversation history from an inbound message.
+///
+/// Uses server-controlled identifiers wherever available to prevent session
+/// hijacking by a malicious caller who supplies a spoofed `sender` field.
+///
+/// - **Telegram**: keyed on `telegram_chat_id` from adapter-set metadata.
+/// - **WebChat** (`/chat` API): prefixed with `"api:"` + caller-supplied sender.
+///   All `/chat` callers share the same API-key trust boundary, so within-boundary
+///   spoofing is acceptable for now.
+/// - **Other channels**: `"<channel>:<sender>"` fallback.
+fn derive_session_key(message: &InboundMessage) -> String {
+    match message.channel {
+        ChannelType::Telegram => {
+            // telegram_chat_id is set by the TelegramAdapter from the server-verified
+            // update object — it cannot be forged by a message sender.
+            let chat_id = message
+                .metadata
+                .get("telegram_chat_id")
+                .and_then(|v| v.as_i64())
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| message.sender.clone());
+            format!("telegram:{chat_id}")
+        }
+        ChannelType::WebChat => {
+            // /chat callers all authenticate with the same API key and share a trust
+            // boundary.  Prefixing with "api:" prevents cross-channel key collisions.
+            format!("api:{}", message.sender)
+        }
+        _ => format!("{:?}:{}", message.channel, message.sender),
+    }
 }
 
 /// Sanitize a sender display name before injecting it into prompts.
@@ -2304,6 +2348,76 @@ mod tests {
         assert_ne!(
             history[0].content, "raw injection payload",
             "Raw input must not be stored in history"
+        );
+    }
+
+    // ── Session key security tests ───────────────────────────────
+
+    #[test]
+    fn test_session_key_telegram_uses_chat_id_from_metadata() {
+        let mut msg = test_message("hello");
+        msg.channel = ChannelType::Telegram;
+        msg.sender = "spoofed_sender".to_string();
+        msg.metadata = serde_json::json!({"telegram_chat_id": 12345_i64});
+
+        let key = derive_session_key(&msg);
+        assert_eq!(
+            key, "telegram:12345",
+            "Telegram key must use server-set chat_id"
+        );
+        assert!(
+            !key.contains("spoofed_sender"),
+            "Telegram key must not use caller-supplied sender"
+        );
+    }
+
+    #[test]
+    fn test_session_key_telegram_falls_back_to_sender_if_no_chat_id() {
+        let mut msg = test_message("hello");
+        msg.channel = ChannelType::Telegram;
+        msg.sender = "99999".to_string();
+        msg.metadata = serde_json::json!({});
+
+        let key = derive_session_key(&msg);
+        assert_eq!(key, "telegram:99999");
+    }
+
+    #[test]
+    fn test_session_key_webchat_uses_api_prefix() {
+        let mut msg = test_message("hello");
+        msg.channel = ChannelType::WebChat;
+        msg.sender = "user1".to_string();
+
+        let key = derive_session_key(&msg);
+        assert_eq!(key, "api:user1");
+    }
+
+    #[test]
+    fn test_session_key_whatsapp_uses_channel_sender_fallback() {
+        let mut msg = test_message("hello");
+        msg.channel = ChannelType::WhatsApp;
+        msg.sender = "15551234".to_string();
+
+        let key = derive_session_key(&msg);
+        assert_eq!(key, "WhatsApp:15551234");
+    }
+
+    #[test]
+    fn test_session_key_telegram_different_chat_ids_are_isolated() {
+        let mut msg_a = test_message("hello");
+        msg_a.channel = ChannelType::Telegram;
+        msg_a.sender = "same_user".to_string();
+        msg_a.metadata = serde_json::json!({"telegram_chat_id": 111_i64});
+
+        let mut msg_b = test_message("hello");
+        msg_b.channel = ChannelType::Telegram;
+        msg_b.sender = "same_user".to_string();
+        msg_b.metadata = serde_json::json!({"telegram_chat_id": 222_i64});
+
+        assert_ne!(
+            derive_session_key(&msg_a),
+            derive_session_key(&msg_b),
+            "Different telegram_chat_ids must produce different session keys"
         );
     }
 }
