@@ -121,10 +121,10 @@ struct Cli {
 
     /// Comma-separated list of trusted sender IDs that bypass `[EXTERNAL_CONTENT]` tagging.
     ///
-    /// Takes priority over `TELEGRAM_ALLOWED_USER_IDS` as a source of trusted senders.
     /// Merged with any `trusted_senders` entries already present in `guardrails.yaml`.
-    #[arg(long, env = "STEWARD_TRUSTED_SENDERS", value_delimiter = ',')]
-    trusted_senders: Option<Vec<String>>,
+    /// Whitespace around each ID is ignored. If unset, no additional senders are trusted.
+    #[arg(long, env = "STEWARD_TRUSTED_SENDERS")]
+    trusted_senders: Option<String>,
 
     /// Bearer token that callers must supply in `Authorization: Bearer <key>`
     /// when calling `POST /chat`. **Required** — if unset, all requests to
@@ -157,23 +157,15 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         )
     })?;
     let system_prompt = build_system_prompt(&steward_config.identity);
-    // Build the trusted-senders list from three sources (in priority order):
+    // Build the trusted-senders list from two sources:
     //   1. guardrails.yaml `trusted_senders`
-    //   2. STEWARD_TRUSTED_SENDERS env var (explicit override)
-    //   3. TELEGRAM_ALLOWED_USER_IDS as a fallback (owner's Telegram ID should be trusted)
+    //   2. STEWARD_TRUSTED_SENDERS env var (additional senders; whitespace trimmed)
     let mut trusted_senders = steward_config.guardrails.trusted_senders.clone();
 
-    if let Some(ref env_senders) = cli.trusted_senders {
-        for s in env_senders {
-            if !trusted_senders.contains(s) {
-                trusted_senders.push(s.clone());
-            }
-        }
-    } else if let Some(ref tg_ids) = cli.telegram_allowed_user_ids {
-        for id in tg_ids {
-            let id_str = id.to_string();
-            if !trusted_senders.contains(&id_str) {
-                trusted_senders.push(id_str);
+    if let Some(ref raw) = cli.trusted_senders {
+        for s in parse_trusted_senders(raw) {
+            if !trusted_senders.contains(&s) {
+                trusted_senders.push(s);
             }
         }
     }
@@ -616,6 +608,22 @@ fn build_system_prompt(identity: &IdentityConfig) -> String {
     )
 }
 
+/// Parse a comma-separated `STEWARD_TRUSTED_SENDERS` value into individual IDs.
+///
+/// Splits on commas and trims whitespace from each token. Empty tokens are discarded.
+///
+/// ```
+/// # use steward_server::parse_trusted_senders; // hypothetical import
+/// let ids = parse_trusted_senders(" 123 , 456 ");
+/// assert_eq!(ids, vec!["123", "456"]);
+/// ```
+fn parse_trusted_senders(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
 // ═══════════════════════════════════════════════════════════════
 // Fallback implementations for when no real channel/memory is
 // configured.
@@ -951,5 +959,29 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn test_parse_trusted_senders_trims_whitespace() {
+        let result = parse_trusted_senders(" 123 , 456 ");
+        assert_eq!(result, vec!["123", "456"]);
+    }
+
+    #[test]
+    fn test_parse_trusted_senders_no_whitespace() {
+        let result = parse_trusted_senders("abc,def");
+        assert_eq!(result, vec!["abc", "def"]);
+    }
+
+    #[test]
+    fn test_parse_trusted_senders_empty_string() {
+        let result = parse_trusted_senders("");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_parse_trusted_senders_skips_empty_tokens() {
+        let result = parse_trusted_senders("123,,456");
+        assert_eq!(result, vec!["123", "456"]);
     }
 }
