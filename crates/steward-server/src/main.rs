@@ -119,6 +119,13 @@ struct Cli {
     #[arg(long, default_value = "pretty", env = "STEWARD_LOG_FORMAT")]
     log_format: String,
 
+    /// Comma-separated list of trusted sender IDs that bypass `[EXTERNAL_CONTENT]` tagging.
+    ///
+    /// Merged with any `trusted_senders` entries already present in `guardrails.yaml`.
+    /// Whitespace around each ID is ignored. If unset, no additional senders are trusted.
+    #[arg(long, env = "STEWARD_TRUSTED_SENDERS")]
+    trusted_senders: Option<String>,
+
     /// Bearer token that callers must supply in `Authorization: Bearer <key>`
     /// when calling `POST /chat`. **Required** — if unset, all requests to
     /// `POST /chat` are rejected with `401 Unauthorized`.
@@ -150,7 +157,19 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         )
     })?;
     let system_prompt = build_system_prompt(&steward_config.identity);
-    let trusted_senders = steward_config.guardrails.trusted_senders.clone();
+    // Build the trusted-senders list from two sources:
+    //   1. guardrails.yaml `trusted_senders`
+    //   2. STEWARD_TRUSTED_SENDERS env var (additional senders; whitespace trimmed)
+    let mut trusted_senders = steward_config.guardrails.trusted_senders.clone();
+
+    if let Some(ref raw) = cli.trusted_senders {
+        for s in parse_trusted_senders(raw) {
+            if !trusted_senders.contains(&s) {
+                trusted_senders.push(s);
+            }
+        }
+    }
+
     info!(
         identity = %steward_config.identity.name,
         trusted_sender_count = trusted_senders.len(),
@@ -338,7 +357,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     error!(sender = %sender, error = %e, "agent handle_message failed");
                     let out = OutboundMessage {
                         recipient: sender.clone(),
-                        text: format!("Error: {e}"),
+                        text: "Sorry, I'm having trouble processing that right now. Please try again in a moment.".to_string(),
                         channel: ch,
                         metadata: serde_json::json!({}),
                     };
@@ -587,6 +606,22 @@ fn build_system_prompt(identity: &IdentityConfig) -> String {
         "{identity_md}\n\n---\n\nWhen using tools, briefly describe what you're about to do. \
          Work through multi-step tasks one step at a time."
     )
+}
+
+/// Parse a comma-separated `STEWARD_TRUSTED_SENDERS` value into individual IDs.
+///
+/// Splits on commas and trims whitespace from each token. Empty tokens are discarded.
+///
+/// ```
+/// # use steward_server::parse_trusted_senders; // hypothetical import
+/// let ids = parse_trusted_senders(" 123 , 456 ");
+/// assert_eq!(ids, vec!["123", "456"]);
+/// ```
+fn parse_trusted_senders(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -924,5 +959,29 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn test_parse_trusted_senders_trims_whitespace() {
+        let result = parse_trusted_senders(" 123 , 456 ");
+        assert_eq!(result, vec!["123", "456"]);
+    }
+
+    #[test]
+    fn test_parse_trusted_senders_no_whitespace() {
+        let result = parse_trusted_senders("abc,def");
+        assert_eq!(result, vec!["abc", "def"]);
+    }
+
+    #[test]
+    fn test_parse_trusted_senders_empty_string() {
+        let result = parse_trusted_senders("");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_parse_trusted_senders_skips_empty_tokens() {
+        let result = parse_trusted_senders("123,,456");
+        assert_eq!(result, vec!["123", "456"]);
     }
 }
