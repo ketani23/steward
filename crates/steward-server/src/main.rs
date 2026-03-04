@@ -532,7 +532,29 @@ async fn chat_handler(
 
     // Stamp server-controlled fields that the agent uses for session keying.
     // These override any caller-supplied values to prevent session hijacking.
-    let session_id = req.session_id.unwrap_or_else(|| Uuid::new_v4().to_string());
+    //
+    // Validate any caller-supplied session_id: must be a valid UUID (≤ 36 chars).
+    // This prevents oversized keys from bloating the in-memory session HashMap.
+    let session_id = match req.session_id {
+        Some(sid) => {
+            if sid.len() > 36 {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "session_id too long"})),
+                )
+                    .into_response();
+            }
+            if uuid::Uuid::parse_str(&sid).is_err() {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "session_id must be a valid UUID"})),
+                )
+                    .into_response();
+            }
+            sid
+        }
+        None => Uuid::new_v4().to_string(),
+    };
     meta["api_principal"] = serde_json::Value::String(principal.clone());
     meta["api_session_id"] = serde_json::Value::String(session_id.clone());
 
@@ -1289,5 +1311,65 @@ mod tests {
         // The echoed session_id matches what aniket sent — aniket is working
         // in their own isolated namespace, not rook's.
         assert_eq!(json2["session_id"].as_str().unwrap(), rook_session_id);
+    }
+
+    // ── session_id validation tests ──────────────────────────────
+
+    #[tokio::test]
+    async fn test_invalid_session_id_returns_400() {
+        let app = build_router(make_test_state(Some("secret".to_string())));
+        let body = serde_json::json!({"text": "hello", "session_id": "not-a-uuid"}).to_string();
+        let resp = app
+            .oneshot(chat_post_with_token_owned(body, "secret"))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "non-UUID session_id must return 400"
+        );
+        let json = parse_response_json(resp).await;
+        assert!(
+            json["error"].as_str().unwrap_or("").contains("UUID"),
+            "error must mention UUID: {json:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_oversized_session_id_returns_400() {
+        let app = build_router(make_test_state(Some("secret".to_string())));
+        // 37+ character string (even if it looks UUID-like) must be rejected
+        let oversized = "a".repeat(37);
+        let body = serde_json::json!({"text": "hello", "session_id": oversized}).to_string();
+        let resp = app
+            .oneshot(chat_post_with_token_owned(body, "secret"))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "oversized session_id must return 400"
+        );
+        let json = parse_response_json(resp).await;
+        assert!(
+            json["error"].as_str().unwrap_or("").contains("too long"),
+            "error must mention too long: {json:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_valid_uuid_session_id_accepted() {
+        let app = build_router(make_test_state(Some("secret".to_string())));
+        let valid_uuid = uuid::Uuid::new_v4().to_string();
+        let body = serde_json::json!({"text": "hello", "session_id": valid_uuid}).to_string();
+        let resp = app
+            .oneshot(chat_post_with_token_owned(body, "secret"))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "valid UUID session_id must be accepted"
+        );
     }
 }
