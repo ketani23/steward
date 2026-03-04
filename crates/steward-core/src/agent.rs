@@ -323,9 +323,10 @@ impl Agent {
         }
 
         // Store this turn in conversation history so the next message has context.
+        // Use sanitized text to prevent injection replay through stored history.
         self.conversation_store.store_turn(
             &session_key,
-            message.text.clone(),
+            sanitized.text.clone(),
             final_response.clone(),
         );
 
@@ -1188,6 +1189,31 @@ mod tests {
                 text: input.text,
                 detections: vec![],
                 truncated: false,
+                source: input.source,
+            })
+        }
+
+        async fn detect_injection(
+            &self,
+            _input: &str,
+        ) -> Result<Vec<InjectionDetection>, StewardError> {
+            Ok(vec![])
+        }
+    }
+
+    /// Ingress sanitizer that replaces the input text with a fixed sanitized value.
+    /// Used to verify that the sanitized text (not the raw input) is stored.
+    struct MockSanitizingIngress {
+        sanitized_text: String,
+    }
+
+    #[async_trait::async_trait]
+    impl IngressSanitizer for MockSanitizingIngress {
+        async fn sanitize(&self, input: RawContent) -> Result<SanitizedContent, StewardError> {
+            Ok(SanitizedContent {
+                text: self.sanitized_text.clone(),
+                detections: vec![],
+                truncated: true,
                 source: input.source,
             })
         }
@@ -2247,5 +2273,37 @@ mod tests {
         assert_eq!(bob_history.len(), 2);
         assert_eq!(alice_history[0].content, "Alice's message");
         assert_eq!(bob_history[0].content, "Bob's message");
+    }
+
+    #[tokio::test]
+    async fn test_conversation_history_stores_sanitized_text() {
+        // Verify that the sanitized text (not the raw input) is stored in history,
+        // preventing injection replay through conversation context.
+        let store = Arc::new(ConversationStore::new());
+        let llm = Arc::new(MockLlm::new(vec![MockLlm::text_response("reply")]));
+        let audit = Arc::new(MockAudit::new());
+        let mut deps = default_deps(llm, audit);
+        deps.conversation_store = Arc::clone(&store);
+        deps.ingress = Arc::new(MockSanitizingIngress {
+            sanitized_text: "[SANITIZED]".to_string(),
+        });
+        let agent = build_agent(deps);
+
+        agent
+            .handle_message(test_message("raw injection payload"))
+            .await
+            .unwrap();
+
+        let history = store.get_history("WhatsApp:user@test.com");
+        assert_eq!(history.len(), 2);
+        // The stored user message must be the sanitized version, not the raw input.
+        assert_eq!(
+            history[0].content, "[SANITIZED]",
+            "History should store sanitized text, not raw input"
+        );
+        assert_ne!(
+            history[0].content, "raw injection payload",
+            "Raw input must not be stored in history"
+        );
     }
 }

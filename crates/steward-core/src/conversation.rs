@@ -57,9 +57,16 @@ impl ConversationStore {
     /// Retrieve the recent message history for a session.
     ///
     /// Returns a cloned snapshot of stored messages (oldest-first).
-    /// Returns an empty `Vec` if the session does not exist or has expired.
+    /// Returns an empty `Vec` if the session does not exist, has expired,
+    /// or if the lock is poisoned.
     pub fn get_history(&self, key: &str) -> Vec<ChatMessage> {
-        let sessions = self.sessions.read().unwrap();
+        let sessions = match self.sessions.read() {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(error = %e, "conversation store read lock poisoned");
+                return vec![];
+            }
+        };
         match sessions.get(key) {
             Some(session) if !session.is_expired() => session.messages.clone(),
             _ => vec![],
@@ -72,7 +79,13 @@ impl ConversationStore {
     /// [`MAX_HISTORY`] messages. Expired sessions are garbage-collected
     /// on each call to this method.
     pub fn store_turn(&self, key: &str, user_message: String, assistant_reply: String) {
-        let mut sessions = self.sessions.write().unwrap();
+        let mut sessions = match self.sessions.write() {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(error = %e, "conversation store write lock poisoned");
+                return;
+            }
+        };
 
         // Lazy cleanup: remove expired sessions on every write.
         sessions.retain(|_, v| !v.is_expired());
