@@ -422,28 +422,26 @@ impl Agent {
                 return ActionResult::Blocked("Action forbidden by permission policy".to_string());
             }
             PermissionTier::HumanApproval => {
-                // Guardian escalation also requires human approval
-                return self
-                    .handle_human_approval(proposal, &verdict, message)
-                    .await;
-            }
-            PermissionTier::AutoExecute | PermissionTier::LogAndExecute => {
-                // If guardian escalated to human, override the auto-execute
-                if verdict.decision == GuardianDecision::EscalateToHuman {
+                // For shell.exec: if the command is readonly-safe, auto-approve at
+                // log_and_execute tier (inline classification, fail-closed).
+                // Otherwise fall through to the normal human-approval flow.
+                if proposal.tool_name == "shell.exec"
+                    && is_readonly_shell_command(&proposal.parameters)
+                {
+                    tracing::info!(
+                        tool = %proposal.tool_name,
+                        "shell.exec command is readonly-safe — auto-approving at log_and_execute tier"
+                    );
+                    // Fall through to execute.
+                } else {
                     return self
                         .handle_human_approval(proposal, &verdict, message)
                         .await;
                 }
-                // For shell.exec.readonly: verify the command is on the safe whitelist
-                // before allowing auto-execution.  If the command is not safe, fall back
-                // to human approval (fail-closed).
-                if proposal.tool_name == "shell.exec.readonly"
-                    && !is_readonly_shell_command(&proposal.parameters)
-                {
-                    tracing::warn!(
-                        tool = %proposal.tool_name,
-                        "shell.exec.readonly command not on safe whitelist — escalating to human approval"
-                    );
+            }
+            PermissionTier::AutoExecute | PermissionTier::LogAndExecute => {
+                // If guardian escalated to human, override the auto-execute
+                if verdict.decision == GuardianDecision::EscalateToHuman {
                     return self
                         .handle_human_approval(proposal, &verdict, message)
                         .await;
@@ -948,22 +946,35 @@ fn derive_session_key(message: &InboundMessage) -> String {
     }
 }
 
-/// Known-safe read-only commands for `shell.exec.readonly` auto-execution.
+/// Known-safe read-only commands for inline `shell.exec` auto-execution.
 ///
 /// Only the binary name (first whitespace-separated token) is checked.
-/// `find` is allowed only without `-exec` to prevent arbitrary command execution.
+/// `find` is allowed only without dangerous flags (see [`is_readonly_shell_command`]).
+/// `env` and `printenv` are excluded — `env CMD` can execute arbitrary commands and
+/// `printenv` may leak sensitive environment variables.
 const READONLY_COMMAND_WHITELIST: &[&str] = &[
     "date", "whoami", "uname", "ls", "cat", "echo", "pwd", "df", "free", "uptime", "ps",
-    "hostname", "id", "env", "printenv", "which", "type", "file", "stat", "wc", "head", "tail",
-    "grep", "find",
+    "hostname", "id", "which", "type", "file", "stat", "wc", "head", "tail", "grep", "find",
 ];
 
-/// Validate that a `shell.exec.readonly` action parameters contain a command that is on
-/// the known-safe whitelist.
+/// Shell metacharacters that can chain arbitrary commands even when the binary is safe.
 ///
-/// Extracts the binary name from the `"command"` parameter and checks it against
-/// [`READONLY_COMMAND_WHITELIST`].  `find` with `-exec` is rejected to prevent
-/// arbitrary command execution through the find utility.
+/// Commands are rejected if any of these appear anywhere in the command string.
+const READONLY_BLOCKED_METACHARACTERS: &[&str] = &["|", ";", "&&", "||", "`", "$(", ">", ">>"];
+
+/// Dangerous `find` flags that allow filesystem modification or arbitrary execution.
+const DANGEROUS_FIND_FLAGS: &[&str] = &[
+    "-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fprintf",
+];
+
+/// Validate that a `shell.exec` action's command is safe to auto-execute.
+///
+/// Performs three checks in order:
+/// 1. Rejects commands containing shell metacharacters (`|`, `;`, `&&`, `||`,
+///    backticks, `$()`, `>`, `>>`) that could chain arbitrary commands.
+/// 2. Rejects binaries not in [`READONLY_COMMAND_WHITELIST`].
+/// 3. For `find`: rejects if any [`DANGEROUS_FIND_FLAGS`] are present
+///    (e.g. `-exec`, `-delete`, `-execdir`).
 ///
 /// Returns `true` if the command is safe to auto-execute, `false` otherwise.
 fn is_readonly_shell_command(parameters: &serde_json::Value) -> bool {
@@ -976,17 +987,29 @@ fn is_readonly_shell_command(parameters: &serde_json::Value) -> bool {
         return false;
     }
 
+    // 1. Reject shell metacharacters — these can chain arbitrary commands.
+    for meta in READONLY_BLOCKED_METACHARACTERS {
+        if command.contains(meta) {
+            return false;
+        }
+    }
+
     let binary = command.split_whitespace().next().unwrap_or("");
     // Strip path prefix (e.g. /usr/bin/ls → ls)
     let binary_name = binary.rsplit('/').next().unwrap_or(binary);
 
+    // 2. Binary must be in the known-safe whitelist.
     if !READONLY_COMMAND_WHITELIST.contains(&binary_name) {
         return false;
     }
 
-    // find with -exec is not safe — it can run arbitrary commands.
-    if binary_name == "find" && command.contains("-exec") {
-        return false;
+    // 3. find with dangerous flags can modify the filesystem or execute arbitrary commands.
+    if binary_name == "find" {
+        for flag in DANGEROUS_FIND_FLAGS {
+            if command.contains(flag) {
+                return false;
+            }
+        }
     }
 
     true
@@ -2298,6 +2321,64 @@ mod tests {
         assert!(!is_readonly_shell_command(
             &serde_json::json!({"command": ""})
         ));
+    }
+
+    #[test]
+    fn test_readonly_rejects_env_executes_arbitrary_command() {
+        // env is no longer whitelisted — `env CMD` executes arbitrary commands.
+        let params = serde_json::json!({"command": "env rm -rf /"});
+        assert!(!is_readonly_shell_command(&params));
+    }
+
+    #[test]
+    fn test_readonly_rejects_find_delete_flag() {
+        // -delete modifies the filesystem.
+        let params = serde_json::json!({"command": "find / -delete"});
+        assert!(!is_readonly_shell_command(&params));
+    }
+
+    #[test]
+    fn test_readonly_rejects_find_fprint_flag() {
+        let params = serde_json::json!({"command": "find /tmp -fprint /tmp/out"});
+        assert!(!is_readonly_shell_command(&params));
+    }
+
+    #[test]
+    fn test_readonly_rejects_find_execdir_flag() {
+        let params = serde_json::json!({"command": "find /tmp -execdir sh {} \\;"});
+        assert!(!is_readonly_shell_command(&params));
+    }
+
+    #[test]
+    fn test_readonly_rejects_metacharacter_pipe() {
+        // Shell metacharacter | can chain arbitrary commands.
+        let params = serde_json::json!({"command": "ls | rm"});
+        assert!(!is_readonly_shell_command(&params));
+    }
+
+    #[test]
+    fn test_readonly_rejects_metacharacter_semicolon() {
+        let params = serde_json::json!({"command": "date; rm -rf /"});
+        assert!(!is_readonly_shell_command(&params));
+    }
+
+    #[test]
+    fn test_readonly_rejects_metacharacter_and_and() {
+        let params = serde_json::json!({"command": "true && rm -rf /"});
+        assert!(!is_readonly_shell_command(&params));
+    }
+
+    #[test]
+    fn test_readonly_rejects_metacharacter_redirect() {
+        let params = serde_json::json!({"command": "echo x > /etc/passwd"});
+        assert!(!is_readonly_shell_command(&params));
+    }
+
+    #[test]
+    fn test_readonly_allows_date() {
+        // date is a safe, readonly command.
+        let params = serde_json::json!({"command": "date"});
+        assert!(is_readonly_shell_command(&params));
     }
 
     #[test]
