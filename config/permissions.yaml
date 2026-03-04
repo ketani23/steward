@@ -21,6 +21,15 @@ tiers:
       - note.create
       - message.draft
       - file.read
+      # Safe, read-only shell commands that do not modify system state.
+      # These require the ShellTool to emit "shell.exec.readonly" as its tool_name
+      # when the requested command matches the safe list (date, whoami, uname, ls,
+      # cat, echo, pwd, df, free, uptime, ps aux).
+      # TODO(shell-granularity): Once the ShellTool classifies commands and uses
+      # "shell.exec.readonly" for pre-approved read-only binaries, this entry
+      # will take effect automatically.  Until then, all shell invocations fall
+      # through to the "shell.exec" entry in human_approval below.
+      - shell.exec.readonly
     constraints:
       rate_limit: 30/minute
 
@@ -34,6 +43,16 @@ tiers:
       - calendar.create
       - calendar.modify
       - purchase.any
+      # Generic shell execution — catches all shell.exec calls that are NOT
+      # re-classified as shell.exec.readonly by the ShellTool.
+      # Dangerous commands (rm, dd, mkfs, chmod, chown, kill, reboot, shutdown,
+      # curl, wget, apt, pip, npm install, docker, sudo) must never reach
+      # shell.exec.readonly; they stay here and require explicit human approval.
+      # Per-command granularity requires the ShellTool to:
+      #   1. Maintain a safe-command allowlist (date, whoami, uname, ls, cat,
+      #      echo, pwd, df, free, uptime, ps).
+      #   2. Emit tool_name "shell.exec.readonly" for commands on that list.
+      #   3. Continue emitting "shell.exec" for everything else (fail-closed).
       - shell.exec
     confirmation:
       channel: same_as_request
