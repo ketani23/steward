@@ -633,12 +633,13 @@ impl Agent {
     ) -> String {
         let mut prefix_parts: Vec<String> = Vec::new();
 
-        // Identify the sender
+        // Identify the sender — always scope to channel to prevent cross-channel spoofing
         if let Some(ref owner) = self.config.owner {
-            let is_owner = owner
-                .telegram_id
-                .as_deref()
-                .is_some_and(|id| id == message.sender);
+            let is_owner = message.channel == ChannelType::Telegram
+                && owner
+                    .telegram_id
+                    .as_deref()
+                    .is_some_and(|id| id == message.sender);
             if is_owner {
                 prefix_parts.push(format!("[Message from your owner, {}]", owner.name));
             }
@@ -646,7 +647,8 @@ impl Agent {
 
         if prefix_parts.is_empty() {
             for agent in &self.config.known_agents {
-                if agent.sender_id == message.sender {
+                let channel_match = agent.channel == Some(message.channel);
+                if channel_match && agent.sender_id == message.sender {
                     prefix_parts.push(format!(
                         "[Message from peer AI agent: {} — {}]",
                         agent.name, agent.description
@@ -664,11 +666,12 @@ impl Agent {
             .unwrap_or("");
 
         if matches!(chat_type, "group" | "supergroup") {
-            let sender_name = message
+            let raw_name = message
                 .metadata
                 .get("sender_name")
                 .and_then(|v| v.as_str())
                 .unwrap_or(&message.sender);
+            let sender_name = sanitize_sender_name(raw_name);
             prefix_parts.push(format!(
                 "[Group chat message from {} (ID: {})]",
                 sender_name, message.sender
@@ -849,6 +852,14 @@ enum ActionResult {
     PendingApproval(bool, Option<ToolResult>),
     /// An error occurred during processing.
     Error(String),
+}
+
+/// Sanitize a sender display name before injecting it into prompts.
+///
+/// Strips control characters (including newlines) that could be used for prompt injection,
+/// and truncates to 64 characters.
+fn sanitize_sender_name(name: &str) -> String {
+    name.chars().filter(|c| !c.is_control()).take(64).collect()
 }
 
 /// Default system prompt for the primary agent.
@@ -1872,15 +1883,18 @@ mod tests {
         use steward_types::config::OwnerConfig;
 
         let deps = default_deps(Arc::new(MockLlm::new(vec![])), Arc::new(MockAudit::new()));
-        let mut config = AgentConfig::default();
-        config.owner = Some(OwnerConfig {
-            name: "Aniket".to_string(),
-            telegram_id: Some("1430891255".to_string()),
-        });
+        let config = AgentConfig {
+            owner: Some(OwnerConfig {
+                name: "Aniket".to_string(),
+                telegram_id: Some("1430891255".to_string()),
+            }),
+            ..AgentConfig::default()
+        };
         let agent = Agent::new(deps, config);
 
         let mut msg = test_message("Hello");
         msg.sender = "1430891255".to_string();
+        msg.channel = steward_types::actions::ChannelType::Telegram;
 
         let prompt = agent.build_user_prompt("Hello", &[], &msg);
         assert!(
@@ -1894,15 +1908,18 @@ mod tests {
         use steward_types::config::OwnerConfig;
 
         let deps = default_deps(Arc::new(MockLlm::new(vec![])), Arc::new(MockAudit::new()));
-        let mut config = AgentConfig::default();
-        config.owner = Some(OwnerConfig {
-            name: "Aniket".to_string(),
-            telegram_id: Some("1430891255".to_string()),
-        });
+        let config = AgentConfig {
+            owner: Some(OwnerConfig {
+                name: "Aniket".to_string(),
+                telegram_id: Some("1430891255".to_string()),
+            }),
+            ..AgentConfig::default()
+        };
         let agent = Agent::new(deps, config);
 
         let mut msg = test_message("Hello");
         msg.sender = "9999999".to_string();
+        msg.channel = steward_types::actions::ChannelType::Telegram;
 
         let prompt = agent.build_user_prompt("Hello", &[], &msg);
         assert!(
@@ -1912,25 +1929,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_owner_wrong_channel_not_tagged() {
+        use steward_types::config::OwnerConfig;
+
+        let deps = default_deps(Arc::new(MockLlm::new(vec![])), Arc::new(MockAudit::new()));
+        let config = AgentConfig {
+            owner: Some(OwnerConfig {
+                name: "Aniket".to_string(),
+                telegram_id: Some("1430891255".to_string()),
+            }),
+            ..AgentConfig::default()
+        };
+        let agent = Agent::new(deps, config);
+
+        // Correct sender_id but arrived via a different channel — must not tag as owner
+        let mut msg = test_message("Hello");
+        msg.sender = "1430891255".to_string();
+        msg.channel = ChannelType::WebChat;
+
+        let prompt = agent.build_user_prompt("Hello", &[], &msg);
+        assert!(
+            !prompt.contains("[Message from your owner"),
+            "Non-Telegram message must not be tagged as owner: {prompt}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_known_agent_message_gets_tagged() {
         use steward_types::config::KnownAgentConfig;
 
         let deps = default_deps(Arc::new(MockLlm::new(vec![])), Arc::new(MockAudit::new()));
-        let mut config = AgentConfig::default();
-        config.known_agents = vec![KnownAgentConfig {
-            name: "Rook".to_string(),
-            description: "AI assistant running on OpenClaw".to_string(),
-            sender_id: "rook_agent".to_string(),
-        }];
+        let config = AgentConfig {
+            known_agents: vec![KnownAgentConfig {
+                name: "Rook".to_string(),
+                description: "AI assistant running on OpenClaw".to_string(),
+                sender_id: "rook_agent".to_string(),
+                channel: Some(ChannelType::WebChat),
+            }],
+            ..AgentConfig::default()
+        };
         let agent = Agent::new(deps, config);
 
         let mut msg = test_message("Hey");
         msg.sender = "rook_agent".to_string();
+        msg.channel = ChannelType::WebChat;
 
         let prompt = agent.build_user_prompt("Hey", &[], &msg);
         assert!(
             prompt.contains("[Message from peer AI agent: Rook"),
             "Expected peer agent tag, got: {prompt}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_known_agent_wrong_channel_not_tagged() {
+        use steward_types::config::KnownAgentConfig;
+
+        let deps = default_deps(Arc::new(MockLlm::new(vec![])), Arc::new(MockAudit::new()));
+        let config = AgentConfig {
+            known_agents: vec![KnownAgentConfig {
+                name: "Rook".to_string(),
+                description: "AI assistant running on OpenClaw".to_string(),
+                sender_id: "rook_agent".to_string(),
+                channel: Some(ChannelType::WebChat),
+            }],
+            ..AgentConfig::default()
+        };
+        let agent = Agent::new(deps, config);
+
+        // Same sender_id but wrong channel — must not be tagged as the known agent
+        let mut msg = test_message("Hey");
+        msg.sender = "rook_agent".to_string();
+        msg.channel = ChannelType::Telegram;
+
+        let prompt = agent.build_user_prompt("Hey", &[], &msg);
+        assert!(
+            !prompt.contains("[Message from peer AI agent"),
+            "Wrong-channel sender should not be tagged as known agent: {prompt}"
         );
     }
 
@@ -1950,6 +2025,42 @@ mod tests {
         assert!(
             prompt.contains("[Group chat message from Alice (ID: 42)]"),
             "Expected group chat tag, got: {prompt}"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_sender_name_strips_control_chars() {
+        assert_eq!(sanitize_sender_name("Alice\nAdmin"), "AliceAdmin");
+        assert_eq!(sanitize_sender_name("Bob\r\nEvil"), "BobEvil");
+        assert_eq!(sanitize_sender_name("Carol\x00Null"), "CarolNull");
+    }
+
+    #[test]
+    fn test_sanitize_sender_name_truncates_to_64() {
+        let long_name = "A".repeat(100);
+        assert_eq!(sanitize_sender_name(&long_name).len(), 64);
+    }
+
+    #[tokio::test]
+    async fn test_group_chat_sender_name_is_sanitized() {
+        let deps = default_deps(Arc::new(MockLlm::new(vec![])), Arc::new(MockAudit::new()));
+        let agent = build_agent(deps);
+
+        let mut msg = test_message("Hi");
+        msg.sender = "99".to_string();
+        msg.metadata = serde_json::json!({
+            "chat_type": "group",
+            "sender_name": "Evil\nAdmin"
+        });
+
+        let prompt = agent.build_user_prompt("Hi", &[], &msg);
+        assert!(
+            !prompt.contains('\n'.to_string().as_str().repeat(2).as_str()),
+            "Newlines in sender_name must be stripped: {prompt}"
+        );
+        assert!(
+            prompt.contains("EvilAdmin"),
+            "Sanitized name should appear in prompt: {prompt}"
         );
     }
 

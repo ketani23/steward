@@ -3,6 +3,7 @@
 /// Full serde types for parsing permissions, guardrails, MCP manifests, and identity
 /// config from YAML/Markdown files. Used by the `ConfigLoader` for directory-based loading,
 /// validation, and hot-reload.
+use crate::actions::ChannelType;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -312,6 +313,12 @@ pub struct KnownAgentConfig {
     pub description: String,
     /// The `sender` field value used when this agent sends messages.
     pub sender_id: String,
+    /// The channel this agent communicates via.
+    ///
+    /// When set, only messages arriving on this channel will match this agent.
+    /// `None` means match on any channel (use with caution).
+    #[serde(default)]
+    pub channel: Option<ChannelType>,
 }
 
 /// Agent identity configuration, parsed from `config/identity.md`.
@@ -455,8 +462,11 @@ fn parse_owner_section(section: &str) -> Option<OwnerConfig> {
 ///
 /// Expects bullet points in the format:
 /// ```text
-/// - AgentName: description text, sender_id "the_id" ...
+/// - AgentName: description text, sender_id "the_id" channel "telegram"
 /// ```
+///
+/// `channel` is optional. Supported values (case-insensitive): `telegram`, `whatsapp`,
+/// `slack`, `webchat`.
 fn parse_known_agents_section(section: &str) -> Vec<KnownAgentConfig> {
     let mut agents = Vec::new();
 
@@ -470,18 +480,24 @@ fn parse_known_agents_section(section: &str) -> Vec<KnownAgentConfig> {
                 // Extract sender_id from `sender_id "value"` pattern
                 let sender_id = extract_quoted_value(rest, "sender_id");
 
-                // Description is everything before the sender_id clause, or the full rest
-                let description = if let Some(idx) = rest.find("sender_id") {
-                    rest[..idx].trim_end_matches([',', ' ']).to_string()
-                } else {
-                    rest.to_string()
-                };
+                // Extract optional channel from `channel "value"` pattern
+                let channel =
+                    extract_quoted_value(rest, "channel").and_then(|s| parse_channel_type(&s));
+
+                // Description is everything before the first keyword clause
+                let desc_end = ["sender_id", "channel"]
+                    .iter()
+                    .filter_map(|kw| rest.find(kw))
+                    .min()
+                    .unwrap_or(rest.len());
+                let description = rest[..desc_end].trim_end_matches([',', ' ']).to_string();
 
                 if let Some(sid) = sender_id {
                     agents.push(KnownAgentConfig {
                         name,
                         description,
                         sender_id: sid,
+                        channel,
                     });
                 }
             }
@@ -489,6 +505,17 @@ fn parse_known_agents_section(section: &str) -> Vec<KnownAgentConfig> {
     }
 
     agents
+}
+
+/// Parse a channel type string (case-insensitive) into a `ChannelType`.
+fn parse_channel_type(s: &str) -> Option<ChannelType> {
+    match s.to_ascii_lowercase().as_str() {
+        "telegram" => Some(ChannelType::Telegram),
+        "whatsapp" => Some(ChannelType::WhatsApp),
+        "slack" => Some(ChannelType::Slack),
+        "webchat" => Some(ChannelType::WebChat),
+        _ => None,
+    }
 }
 
 /// Extract the value of a `key "value"` pattern from a string.
@@ -588,7 +615,7 @@ You are Steward.
 
 ## Known Agents
 
-- Rook: AI assistant running on OpenClaw, sender_id "rook_agent" via API
+- Rook: AI assistant running on OpenClaw, sender_id "rook_agent" channel "webchat"
 "#;
 
     #[test]
@@ -607,6 +634,15 @@ You are Steward.
         assert_eq!(agent.name, "Rook");
         assert_eq!(agent.sender_id, "rook_agent");
         assert!(agent.description.contains("OpenClaw"));
+        assert_eq!(agent.channel, Some(ChannelType::WebChat));
+    }
+
+    #[test]
+    fn test_from_markdown_known_agent_no_channel_defaults_none() {
+        let md = "# Steward\n\n## Known Agents\n\n- Rook: description, sender_id \"rook_agent\"\n";
+        let config = IdentityConfig::from_markdown(md).unwrap();
+        assert_eq!(config.known_agents.len(), 1);
+        assert_eq!(config.known_agents[0].channel, None);
     }
 
     #[test]
