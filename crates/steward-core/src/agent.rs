@@ -889,9 +889,11 @@ enum ActionResult {
 /// hijacking by a malicious caller who supplies a spoofed `sender` field.
 ///
 /// - **Telegram**: keyed on `telegram_chat_id` from adapter-set metadata.
-/// - **WebChat** (`/chat` API): prefixed with `"api:"` + caller-supplied sender.
-///   All `/chat` callers share the same API-key trust boundary, so within-boundary
-///   spoofing is acceptable for now.
+/// - **WebChat** (`/chat` API): keyed on `api:{principal}:{session_id}` where
+///   both `api_principal` and `api_session_id` are stamped by the auth handler
+///   from the verified API key — not caller-supplied. Falls back to
+///   `api:{principal}:{sender}` if no session_id is present, and to
+///   `api:{sender}` if no principal metadata is present either.
 /// - **Other channels**: `"<channel>:<sender>"` fallback.
 fn derive_session_key(message: &InboundMessage) -> String {
     match message.channel {
@@ -907,9 +909,23 @@ fn derive_session_key(message: &InboundMessage) -> String {
             format!("telegram:{chat_id}")
         }
         ChannelType::WebChat => {
-            // /chat callers all authenticate with the same API key and share a trust
-            // boundary.  Prefixing with "api:" prevents cross-channel key collisions.
-            format!("api:{}", message.sender)
+            // api_principal and api_session_id are stamped by the chat_handler auth
+            // layer — they are server-controlled and cannot be forged by the caller.
+            // This ensures each API key principal has an isolated session namespace.
+            let principal = message
+                .metadata
+                .get("api_principal")
+                .and_then(|v| v.as_str())
+                .unwrap_or("default");
+            if let Some(sid) = message
+                .metadata
+                .get("api_session_id")
+                .and_then(|v| v.as_str())
+            {
+                format!("api:{principal}:{sid}")
+            } else {
+                format!("api:{principal}:{}", message.sender)
+            }
         }
         _ => format!("{:?}:{}", message.channel, message.sender),
     }
@@ -2383,13 +2399,37 @@ mod tests {
     }
 
     #[test]
-    fn test_session_key_webchat_uses_api_prefix() {
+    fn test_session_key_webchat_with_principal_and_session_id() {
         let mut msg = test_message("hello");
         msg.channel = ChannelType::WebChat;
         msg.sender = "user1".to_string();
+        msg.metadata = serde_json::json!({"api_principal": "rook", "api_session_id": "sess-abc"});
 
         let key = derive_session_key(&msg);
-        assert_eq!(key, "api:user1");
+        assert_eq!(key, "api:rook:sess-abc");
+    }
+
+    #[test]
+    fn test_session_key_webchat_falls_back_to_principal_and_sender_without_session_id() {
+        let mut msg = test_message("hello");
+        msg.channel = ChannelType::WebChat;
+        msg.sender = "user1".to_string();
+        msg.metadata = serde_json::json!({"api_principal": "rook"});
+
+        let key = derive_session_key(&msg);
+        assert_eq!(key, "api:rook:user1");
+    }
+
+    #[test]
+    fn test_session_key_webchat_falls_back_to_default_principal_without_metadata() {
+        // No api_principal or api_session_id — e.g. messages from the channel loop.
+        let mut msg = test_message("hello");
+        msg.channel = ChannelType::WebChat;
+        msg.sender = "user1".to_string();
+        msg.metadata = serde_json::json!({});
+
+        let key = derive_session_key(&msg);
+        assert_eq!(key, "api:default:user1");
     }
 
     #[test]
@@ -2418,6 +2458,51 @@ mod tests {
             derive_session_key(&msg_a),
             derive_session_key(&msg_b),
             "Different telegram_chat_ids must produce different session keys"
+        );
+    }
+
+    #[test]
+    fn test_session_key_webchat_different_principals_same_session_id_are_isolated() {
+        // Two callers with different API keys (principals) but sharing the same
+        // session_id must land in different session buckets.
+        let mut msg_rook = test_message("hello");
+        msg_rook.channel = ChannelType::WebChat;
+        msg_rook.sender = "alice".to_string();
+        msg_rook.metadata =
+            serde_json::json!({"api_principal": "rook", "api_session_id": "shared-sid"});
+
+        let mut msg_aniket = test_message("hello");
+        msg_aniket.channel = ChannelType::WebChat;
+        msg_aniket.sender = "alice".to_string();
+        msg_aniket.metadata =
+            serde_json::json!({"api_principal": "aniket", "api_session_id": "shared-sid"});
+
+        assert_ne!(
+            derive_session_key(&msg_rook),
+            derive_session_key(&msg_aniket),
+            "Same session_id across different principals must not share a session"
+        );
+    }
+
+    #[test]
+    fn test_session_key_webchat_same_principal_same_session_id_share_session() {
+        // Same principal + same session_id → same session key (multi-turn continuity).
+        let mut msg1 = test_message("turn 1");
+        msg1.channel = ChannelType::WebChat;
+        msg1.sender = "alice".to_string();
+        msg1.metadata =
+            serde_json::json!({"api_principal": "rook", "api_session_id": "my-session"});
+
+        let mut msg2 = test_message("turn 2");
+        msg2.channel = ChannelType::WebChat;
+        msg2.sender = "alice".to_string();
+        msg2.metadata =
+            serde_json::json!({"api_principal": "rook", "api_session_id": "my-session"});
+
+        assert_eq!(
+            derive_session_key(&msg1),
+            derive_session_key(&msg2),
+            "Same principal + session_id must produce the same session key"
         );
     }
 }

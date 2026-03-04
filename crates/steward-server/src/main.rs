@@ -9,6 +9,7 @@
 //! - Message processing loop (inbound → agent → outbound)
 //! - Graceful shutdown on SIGTERM/SIGINT
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -127,9 +128,16 @@ struct Cli {
     #[arg(long, env = "STEWARD_TRUSTED_SENDERS")]
     trusted_senders: Option<String>,
 
+    /// Named API keys for `POST /chat`. Format: `principal1:key1,principal2:key2`.
+    ///
+    /// When set, takes precedence over `STEWARD_API_KEY`. Each key maps to a
+    /// principal name that namespaces its conversation sessions.
+    #[arg(long, env = "STEWARD_API_KEYS")]
+    api_keys: Option<String>,
+
     /// Bearer token that callers must supply in `Authorization: Bearer <key>`
-    /// when calling `POST /chat`. **Required** — if unset, all requests to
-    /// `POST /chat` are rejected with `401 Unauthorized`.
+    /// when calling `POST /chat`. Legacy single-key form — use `STEWARD_API_KEYS`
+    /// for named principals. If `STEWARD_API_KEYS` is set this is ignored.
     #[arg(long, env = "STEWARD_API_KEY")]
     api_key: Option<String>,
 }
@@ -381,7 +389,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // ── 11. HTTP server (webhook endpoints) ─────────────────────
     let app = build_router(AppState {
         agent: Arc::clone(&agent),
-        api_key: cli.api_key.clone(),
+        api_keys: build_api_keys_map(cli.api_keys.as_deref(), cli.api_key.as_deref()),
     });
 
     let addr: SocketAddr = format!("{}:{}", cli.host, cli.port).parse()?;
@@ -415,8 +423,11 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 #[derive(Clone)]
 struct AppState {
     agent: Arc<Agent>,
-    /// If set, `POST /chat` requires `Authorization: Bearer <api_key>`.
-    api_key: Option<String>,
+    /// Map from bearer token → principal name for `POST /chat` auth.
+    ///
+    /// An empty map means no keys are configured and every request is rejected
+    /// with `401 Unauthorized` (fail-closed).
+    api_keys: HashMap<String, String>,
 }
 
 /// Request body for `POST /chat`.
@@ -433,6 +444,12 @@ struct ChatRequest {
     /// Additional caller metadata merged into the inbound message.
     #[serde(default)]
     metadata: serde_json::Value,
+    /// Optional: resume a previous session by its server-issued session ID.
+    ///
+    /// If absent, the server generates a new UUID for this session. Pass the
+    /// `session_id` from a prior response to continue that conversation.
+    #[serde(default)]
+    session_id: Option<String>,
 }
 
 /// Response body for `POST /chat`.
@@ -444,6 +461,9 @@ struct ChatResponse {
     message_id: String,
     /// ISO-8601 timestamp of when the response was produced.
     timestamp: String,
+    /// Stable session handle. Pass this back in subsequent requests as
+    /// `session_id` to continue the same conversation.
+    session_id: String,
 }
 
 /// Handle `POST /chat` — synchronous HTTP interface to the agent.
@@ -452,37 +472,44 @@ struct ChatResponse {
 /// runs it through the full agent pipeline, and returns the reply.
 ///
 /// # Auth
-/// `STEWARD_API_KEY` must be set. The caller must include:
-/// `Authorization: Bearer <api_key>`
-/// Requests with a missing, incorrect, or unconfigured key receive `401 Unauthorized`.
+/// `STEWARD_API_KEYS` (or legacy `STEWARD_API_KEY`) must be set. The caller
+/// must include: `Authorization: Bearer <key>`. Requests with a missing,
+/// incorrect, or unconfigured key receive `401 Unauthorized`.
+///
+/// # Sessions
+/// Each response includes a `session_id`. Pass it back in subsequent requests
+/// to continue the same conversation. If omitted, the server generates a new
+/// UUID. Sessions are namespaced per-principal so keys from different callers
+/// can never access each other's history.
 async fn chat_handler(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     Json(req): Json<ChatRequest>,
 ) -> impl IntoResponse {
     // ── Auth check (fail-closed) ─────────────────────────────
-    match &state.api_key {
+    if state.api_keys.is_empty() {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "API keys not configured"})),
+        )
+            .into_response();
+    }
+
+    let token = headers
+        .get("Authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+
+    let principal = match token.and_then(|t| state.api_keys.get(t)) {
+        Some(p) => p.clone(),
         None => {
             return (
                 StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({"error": "STEWARD_API_KEY not configured"})),
+                Json(serde_json::json!({"error": "Unauthorized"})),
             )
                 .into_response();
         }
-        Some(expected) => {
-            let token = headers
-                .get("Authorization")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.strip_prefix("Bearer "));
-            if token != Some(expected.as_str()) {
-                return (
-                    StatusCode::UNAUTHORIZED,
-                    Json(serde_json::json!({"error": "Unauthorized"})),
-                )
-                    .into_response();
-            }
-        }
-    }
+    };
 
     // ── Build InboundMessage ─────────────────────────────────
     let msg_id = Uuid::new_v4();
@@ -502,6 +529,13 @@ async fn chat_handler(
     if let Some(name) = req.sender_name {
         meta["sender_name"] = serde_json::Value::String(name);
     }
+
+    // Stamp server-controlled fields that the agent uses for session keying.
+    // These override any caller-supplied values to prevent session hijacking.
+    let session_id = req.session_id.unwrap_or_else(|| Uuid::new_v4().to_string());
+    meta["api_principal"] = serde_json::Value::String(principal.clone());
+    meta["api_session_id"] = serde_json::Value::String(session_id.clone());
+
     let msg = InboundMessage {
         id: msg_id,
         text: req.text,
@@ -519,6 +553,7 @@ async fn chat_handler(
                 response,
                 message_id: msg_id.to_string(),
                 timestamp: chrono::Utc::now().to_rfc3339(),
+                session_id,
             }),
         )
             .into_response(),
@@ -618,6 +653,45 @@ fn build_system_prompt(identity: &IdentityConfig) -> String {
     )
 }
 
+/// Build the API keys map from CLI/env inputs.
+///
+/// If `api_keys_raw` (from `STEWARD_API_KEYS`) is provided it takes precedence.
+/// Otherwise, if the legacy `api_key` (from `STEWARD_API_KEY`) is provided, it
+/// is treated as a single key with principal `"default"`. Returns an empty map
+/// if neither is set (every `/chat` request will be rejected with `401`).
+fn build_api_keys_map(
+    api_keys_raw: Option<&str>,
+    api_key_legacy: Option<&str>,
+) -> HashMap<String, String> {
+    if let Some(raw) = api_keys_raw {
+        parse_api_keys(raw)
+    } else if let Some(key) = api_key_legacy {
+        let mut map = HashMap::new();
+        map.insert(key.to_string(), "default".to_string());
+        map
+    } else {
+        HashMap::new()
+    }
+}
+
+/// Parse a `STEWARD_API_KEYS` value (`"name1:key1,name2:key2"`) into a
+/// token → principal map.
+///
+/// Entries with a missing colon, empty name, or empty key are silently skipped.
+fn parse_api_keys(raw: &str) -> HashMap<String, String> {
+    raw.split(',')
+        .filter_map(|entry| {
+            let (name, key) = entry.trim().split_once(':')?;
+            let name = name.trim();
+            let key = key.trim();
+            if name.is_empty() || key.is_empty() {
+                return None;
+            }
+            Some((key.to_string(), name.to_string()))
+        })
+        .collect()
+}
+
 /// Parse a comma-separated `STEWARD_TRUSTED_SENDERS` value into individual IDs.
 ///
 /// Splits on commas and trims whitespace from each token. Empty tokens are discarded.
@@ -700,7 +774,7 @@ impl steward_types::traits::ChannelAdapter for ConsoleChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::body::Body;
+    use axum::body::{to_bytes, Body};
     use axum::http::Request;
     use steward_types::actions::*;
     use steward_types::errors::{RateLimitExceeded, StewardError};
@@ -863,8 +937,8 @@ mod tests {
         }
     }
 
-    fn make_test_state(api_key: Option<String>) -> AppState {
-        let agent = Arc::new(Agent::new(
+    fn make_agent() -> Arc<Agent> {
+        Arc::new(Agent::new(
             AgentDeps {
                 llm: Arc::new(MockLlm),
                 guardian: Arc::new(MockGuardian),
@@ -878,8 +952,23 @@ mod tests {
                 conversation_store: Arc::new(ConversationStore::new()),
             },
             AgentConfig::default(),
-        ));
-        AppState { agent, api_key }
+        ))
+    }
+
+    /// Build test state using the legacy single-key path (backward compat helper).
+    fn make_test_state(api_key: Option<String>) -> AppState {
+        AppState {
+            agent: make_agent(),
+            api_keys: build_api_keys_map(None, api_key.as_deref()),
+        }
+    }
+
+    /// Build test state with an explicit multi-key map.
+    fn make_test_state_multi(keys: HashMap<String, String>) -> AppState {
+        AppState {
+            agent: make_agent(),
+            api_keys: keys,
+        }
     }
 
     fn chat_post(body: &'static str) -> Request<Body> {
@@ -899,6 +988,21 @@ mod tests {
             .header("authorization", format!("Bearer {token}"))
             .body(Body::from(body))
             .unwrap()
+    }
+
+    fn chat_post_with_token_owned(body: String, token: &str) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/chat")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    async fn parse_response_json(resp: axum::response::Response) -> serde_json::Value {
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
     }
 
     #[tokio::test]
@@ -994,5 +1098,196 @@ mod tests {
     fn test_parse_trusted_senders_skips_empty_tokens() {
         let result = parse_trusted_senders("123,,456");
         assert_eq!(result, vec!["123", "456"]);
+    }
+
+    // ── parse_api_keys tests ────────────────────────────────────
+
+    #[test]
+    fn test_parse_api_keys_valid_entries() {
+        let map = parse_api_keys("rook:abc123,aniket:def456");
+        assert_eq!(map.get("abc123").map(String::as_str), Some("rook"));
+        assert_eq!(map.get("def456").map(String::as_str), Some("aniket"));
+        assert_eq!(map.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_api_keys_trims_whitespace() {
+        let map = parse_api_keys(" rook : abc123 , aniket : def456 ");
+        assert_eq!(map.get("abc123").map(String::as_str), Some("rook"));
+        assert_eq!(map.get("def456").map(String::as_str), Some("aniket"));
+    }
+
+    #[test]
+    fn test_parse_api_keys_skips_entries_without_colon() {
+        let map = parse_api_keys("nocolon,rook:goodkey");
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.get("goodkey").map(String::as_str), Some("rook"));
+    }
+
+    #[test]
+    fn test_parse_api_keys_skips_empty_name_or_key() {
+        let map = parse_api_keys(":emptyname,:,validname:validkey");
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.get("validkey").map(String::as_str), Some("validname"));
+    }
+
+    #[test]
+    fn test_parse_api_keys_empty_string() {
+        let map = parse_api_keys("");
+        assert!(map.is_empty());
+    }
+
+    // ── build_api_keys_map tests ────────────────────────────────
+
+    #[test]
+    fn test_build_api_keys_map_legacy_single_key_uses_default_principal() {
+        let map = build_api_keys_map(None, Some("mylegacykey"));
+        assert_eq!(map.get("mylegacykey").map(String::as_str), Some("default"));
+        assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn test_build_api_keys_map_multi_key_takes_precedence_over_legacy() {
+        // STEWARD_API_KEYS overrides STEWARD_API_KEY entirely.
+        let map = build_api_keys_map(Some("rook:newkey"), Some("oldlegacykey"));
+        assert_eq!(map.get("newkey").map(String::as_str), Some("rook"));
+        assert!(
+            !map.contains_key("oldlegacykey"),
+            "legacy key must be ignored"
+        );
+    }
+
+    #[test]
+    fn test_build_api_keys_map_neither_set_returns_empty() {
+        let map = build_api_keys_map(None, None);
+        assert!(map.is_empty());
+    }
+
+    // ── session_id tests ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_chat_response_includes_session_id() {
+        let app = build_router(make_test_state(Some("secret".to_string())));
+        let resp = app
+            .oneshot(chat_post_with_token(r#"{"text":"hello"}"#, "secret"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = parse_response_json(resp).await;
+        let session_id = json["session_id"]
+            .as_str()
+            .expect("session_id must be present");
+        // Must be a valid UUID
+        uuid::Uuid::parse_str(session_id).expect("session_id must be a valid UUID");
+    }
+
+    #[tokio::test]
+    async fn test_session_id_roundtrip() {
+        // Caller passes back the session_id from a previous response;
+        // the server echoes the same session_id in the next response.
+        let state = make_test_state(Some("secret".to_string()));
+        let app1 = build_router(state.clone());
+        let app2 = build_router(state);
+
+        // First request: server generates a session_id.
+        let resp1 = app1
+            .oneshot(chat_post_with_token(r#"{"text":"hello"}"#, "secret"))
+            .await
+            .unwrap();
+        let json1 = parse_response_json(resp1).await;
+        let session_id = json1["session_id"].as_str().unwrap().to_string();
+
+        // Second request: caller supplies the session_id.
+        let body2 =
+            serde_json::json!({"text": "hello again", "session_id": session_id}).to_string();
+        let resp2 = app2
+            .oneshot(chat_post_with_token_owned(body2, "secret"))
+            .await
+            .unwrap();
+        assert_eq!(resp2.status(), StatusCode::OK);
+        let json2 = parse_response_json(resp2).await;
+        assert_eq!(
+            json2["session_id"].as_str().unwrap(),
+            session_id,
+            "server must echo back the caller-supplied session_id"
+        );
+    }
+
+    // ── principal / session isolation tests ─────────────────────
+
+    #[tokio::test]
+    async fn test_two_api_keys_same_sender_id_get_different_principals() {
+        // Two callers sharing the same sender_id but different API keys must
+        // get separate sessions because their principals differ.
+        let mut keys = HashMap::new();
+        keys.insert("key-rook".to_string(), "rook".to_string());
+        keys.insert("key-aniket".to_string(), "aniket".to_string());
+        let state = make_test_state_multi(keys);
+
+        let app1 = build_router(state.clone());
+        let app2 = build_router(state);
+
+        let body = r#"{"text":"hello","sender_id":"shared-sender"}"#;
+        let resp1 = app1
+            .oneshot(chat_post_with_token(body, "key-rook"))
+            .await
+            .unwrap();
+        let resp2 = app2
+            .oneshot(chat_post_with_token(body, "key-aniket"))
+            .await
+            .unwrap();
+
+        assert_eq!(resp1.status(), StatusCode::OK);
+        assert_eq!(resp2.status(), StatusCode::OK);
+
+        let json1 = parse_response_json(resp1).await;
+        let json2 = parse_response_json(resp2).await;
+
+        // Both get valid (but different) session UUIDs, confirming isolated namespaces.
+        let sid1 = json1["session_id"].as_str().unwrap();
+        let sid2 = json2["session_id"].as_str().unwrap();
+        uuid::Uuid::parse_str(sid1).unwrap();
+        uuid::Uuid::parse_str(sid2).unwrap();
+        assert_ne!(
+            sid1, sid2,
+            "independent new sessions must have different UUIDs"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_caller_cannot_hijack_session_across_principals() {
+        // Even if a caller guesses another principal's session_id, the session
+        // keys are isolated: api:rook:<sid> ≠ api:aniket:<sid>.
+        let mut keys = HashMap::new();
+        keys.insert("key-rook".to_string(), "rook".to_string());
+        keys.insert("key-aniket".to_string(), "aniket".to_string());
+        let state = make_test_state_multi(keys);
+
+        let app1 = build_router(state.clone());
+        let app2 = build_router(state);
+
+        // rook creates a session.
+        let resp1 = app1
+            .oneshot(chat_post_with_token(r#"{"text":"hi"}"#, "key-rook"))
+            .await
+            .unwrap();
+        let json1 = parse_response_json(resp1).await;
+        let rook_session_id = json1["session_id"].as_str().unwrap().to_string();
+
+        // aniket attempts to reuse rook's session_id.
+        let hijack_body =
+            serde_json::json!({"text": "hi", "session_id": rook_session_id}).to_string();
+        let resp2 = app2
+            .oneshot(chat_post_with_token_owned(hijack_body, "key-aniket"))
+            .await
+            .unwrap();
+        // Request succeeds (auth passes), but aniket's session key is
+        // api:aniket:<rook_session_id> — a completely separate history.
+        // The server doesn't error because the session_id is just a namespace key.
+        assert_eq!(resp2.status(), StatusCode::OK);
+        let json2 = parse_response_json(resp2).await;
+        // The echoed session_id matches what aniket sent — aniket is working
+        // in their own isolated namespace, not rook's.
+        assert_eq!(json2["session_id"].as_str().unwrap(), rook_session_id);
     }
 }
