@@ -403,7 +403,7 @@ impl Agent {
         }
 
         // Step 2: Permission check
-        let tier = self.permissions.classify(proposal);
+        let mut tier = self.permissions.classify(proposal);
 
         self.log_permission_check(proposal, tier).await;
 
@@ -422,8 +422,16 @@ impl Agent {
                 return ActionResult::Blocked("Action forbidden by permission policy".to_string());
             }
             PermissionTier::HumanApproval => {
-                // For shell.exec: if the command is readonly-safe, auto-approve at
-                // log_and_execute tier (inline classification, fail-closed).
+                // Guardian escalation always wins — even readonly commands must go
+                // through human approval when the guardian says EscalateToHuman.
+                if verdict.decision == GuardianDecision::EscalateToHuman {
+                    return self
+                        .handle_human_approval(proposal, &verdict, message)
+                        .await;
+                }
+                // For shell.exec: if the command is readonly-safe and guardian
+                // allowed it, auto-approve at log_and_execute tier (inline
+                // classification, fail-closed).
                 // Otherwise fall through to the normal human-approval flow.
                 if proposal.tool_name == "shell.exec"
                     && is_readonly_shell_command(&proposal.parameters)
@@ -432,7 +440,8 @@ impl Agent {
                         tool = %proposal.tool_name,
                         "shell.exec command is readonly-safe — auto-approving at log_and_execute tier"
                     );
-                    // Fall through to execute.
+                    // Downgrade to LogAndExecute so audit logs are accurate.
+                    tier = PermissionTier::LogAndExecute;
                 } else {
                     return self
                         .handle_human_approval(proposal, &verdict, message)
@@ -1700,6 +1709,58 @@ mod tests {
         assert!(
             !approval_events.is_empty(),
             "Should have UserApproval audit event"
+        );
+    }
+
+    /// A readonly shell command (e.g. `date`) must NOT be auto-executed when the
+    /// guardian verdict is EscalateToHuman.  The escalation verdict takes priority
+    /// over the readonly fast-path and the action must go through the human-approval
+    /// flow regardless.
+    #[tokio::test]
+    async fn test_readonly_shell_command_with_guardian_escalation_requires_human_approval() {
+        let llm = Arc::new(MockLlm::new(vec![
+            MockLlm::tool_response("shell.exec", serde_json::json!({"command": "date"})),
+            MockLlm::text_response("The date command was not run because approval was denied."),
+        ]));
+        let audit = Arc::new(MockAudit::new());
+        let mut deps = default_deps(llm, audit.clone());
+        // Guardian says escalate — this must override the readonly auto-approve path.
+        deps.guardian = Arc::new(MockGuardian::escalating());
+        deps.permissions = Arc::new(MockPermissions::with_tier(PermissionTier::HumanApproval));
+        deps.tools = Arc::new(MockTools::success("Wed Jan  1 00:00:00 UTC 2025"));
+        // Channel rejects so we can observe the approval-request path without executing.
+        deps.channel = Arc::new(MockChannel::rejecting());
+        let agent = build_agent(deps);
+
+        agent
+            .handle_message(test_message("What is today's date?"))
+            .await
+            .unwrap();
+
+        let events = audit.events();
+        // A UserApproval event must have been emitted — confirming the human-approval
+        // path was reached and the command was NOT silently auto-executed.
+        let approval_events: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(e.event_type, AuditEventType::UserApproval))
+            .collect();
+        assert!(
+            !approval_events.is_empty(),
+            "Guardian EscalateToHuman must trigger human approval even for readonly shell commands"
+        );
+        // The tool must NOT have been executed.  Real tool execution is recorded as a
+        // ToolCall event with Executed outcome (from execute_and_filter).  PermissionCheck
+        // events also carry Executed as a placeholder, so we must filter by event_type.
+        let executed_tool_events: Vec<_> = events
+            .iter()
+            .filter(|e| {
+                matches!(e.event_type, AuditEventType::ToolCall)
+                    && matches!(e.outcome, ActionOutcome::Executed)
+            })
+            .collect();
+        assert!(
+            executed_tool_events.is_empty(),
+            "shell.exec must not auto-execute when guardian says EscalateToHuman"
         );
     }
 
