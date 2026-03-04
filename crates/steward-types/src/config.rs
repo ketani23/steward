@@ -3,6 +3,7 @@
 /// Full serde types for parsing permissions, guardrails, MCP manifests, and identity
 /// config from YAML/Markdown files. Used by the `ConfigLoader` for directory-based loading,
 /// validation, and hot-reload.
+use crate::actions::ChannelType;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -289,6 +290,37 @@ impl Default for CircuitBreakerConfig {
 // Identity Configuration (identity.md)
 // ============================================================
 
+/// Owner identity parsed from the `## Owner` section of `identity.md`.
+///
+/// Used to identify messages from the owner and inject trust context into the agent's prompt.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OwnerConfig {
+    /// Owner's display name.
+    pub name: String,
+    /// Owner's Telegram user ID, if applicable.
+    #[serde(default)]
+    pub telegram_id: Option<String>,
+}
+
+/// A known peer agent parsed from the `## Known Agents` section of `identity.md`.
+///
+/// Used to identify messages from trusted AI peers and inject peer-agent context.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KnownAgentConfig {
+    /// Agent's display name.
+    pub name: String,
+    /// Description of what this agent does and where it runs.
+    pub description: String,
+    /// The `sender` field value used when this agent sends messages.
+    pub sender_id: String,
+    /// The channel this agent communicates via.
+    ///
+    /// When set, only messages arriving on this channel will match this agent.
+    /// `None` means match on any channel (use with caution).
+    #[serde(default)]
+    pub channel: Option<ChannelType>,
+}
+
 /// Agent identity configuration, parsed from `config/identity.md`.
 ///
 /// Supports markdown files with a title, personality section, and
@@ -305,6 +337,12 @@ pub struct IdentityConfig {
     /// The raw markdown content for direct system prompt injection.
     #[serde(default)]
     pub raw_markdown: String,
+    /// Owner configuration parsed from the `## Owner` section.
+    #[serde(default)]
+    pub owner: Option<OwnerConfig>,
+    /// Known peer agents parsed from the `## Known Agents` section.
+    #[serde(default)]
+    pub known_agents: Vec<KnownAgentConfig>,
 }
 
 impl IdentityConfig {
@@ -325,6 +363,15 @@ impl IdentityConfig {
     ///
     /// - Boundary 1
     /// - Boundary 2
+    ///
+    /// ## Owner
+    ///
+    /// - Name: Alice
+    /// - Telegram ID: 123456789
+    ///
+    /// ## Known Agents
+    ///
+    /// - Rook: AI assistant running on OpenClaw, sender_id "rook_agent" via API
     /// ```
     pub fn from_markdown(content: &str) -> Result<Self, crate::errors::StewardError> {
         let raw_markdown = content.to_string();
@@ -353,6 +400,15 @@ impl IdentityConfig {
             })
             .unwrap_or_default();
 
+        // Extract owner config from ## Owner section
+        let owner = sections.get("owner").and_then(|s| parse_owner_section(s));
+
+        // Extract known agents from ## Known Agents section
+        let known_agents = sections
+            .get("known agents")
+            .map(|s| parse_known_agents_section(s))
+            .unwrap_or_default();
+
         if name.is_empty() {
             return Err(crate::errors::StewardError::Config(
                 "identity.md must have a title (# heading)".to_string(),
@@ -364,8 +420,110 @@ impl IdentityConfig {
             personality,
             boundaries,
             raw_markdown,
+            owner,
+            known_agents,
         })
     }
+}
+
+/// Parse the `## Owner` section into an `OwnerConfig`.
+///
+/// Expects key-value bullet points:
+/// ```text
+/// - Name: Alice
+/// - Telegram ID: 123456789
+/// ```
+fn parse_owner_section(section: &str) -> Option<OwnerConfig> {
+    let mut name = None;
+    let mut telegram_id = None;
+
+    for line in section.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("- ") {
+            if let Some((key, value)) = rest.split_once(':') {
+                let key = key.trim().to_lowercase();
+                let value = value.trim().to_string();
+                match key.as_str() {
+                    "name" => name = Some(value),
+                    "telegram id" => telegram_id = Some(value),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    name.map(|n| OwnerConfig {
+        name: n,
+        telegram_id,
+    })
+}
+
+/// Parse the `## Known Agents` section into a list of `KnownAgentConfig`.
+///
+/// Expects bullet points in the format:
+/// ```text
+/// - AgentName: description text, sender_id "the_id" channel "telegram"
+/// ```
+///
+/// `channel` is optional. Supported values (case-insensitive): `telegram`, `whatsapp`,
+/// `slack`, `webchat`.
+fn parse_known_agents_section(section: &str) -> Vec<KnownAgentConfig> {
+    let mut agents = Vec::new();
+
+    for line in section.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("- ") {
+            if let Some((name, rest)) = rest.split_once(':') {
+                let name = name.trim().to_string();
+                let rest = rest.trim();
+
+                // Extract sender_id from `sender_id "value"` pattern
+                let sender_id = extract_quoted_value(rest, "sender_id");
+
+                // Extract optional channel from `channel "value"` pattern
+                let channel =
+                    extract_quoted_value(rest, "channel").and_then(|s| parse_channel_type(&s));
+
+                // Description is everything before the first keyword clause
+                let desc_end = ["sender_id", "channel"]
+                    .iter()
+                    .filter_map(|kw| rest.find(kw))
+                    .min()
+                    .unwrap_or(rest.len());
+                let description = rest[..desc_end].trim_end_matches([',', ' ']).to_string();
+
+                if let Some(sid) = sender_id {
+                    agents.push(KnownAgentConfig {
+                        name,
+                        description,
+                        sender_id: sid,
+                        channel,
+                    });
+                }
+            }
+        }
+    }
+
+    agents
+}
+
+/// Parse a channel type string (case-insensitive) into a `ChannelType`.
+fn parse_channel_type(s: &str) -> Option<ChannelType> {
+    match s.to_ascii_lowercase().as_str() {
+        "telegram" => Some(ChannelType::Telegram),
+        "whatsapp" => Some(ChannelType::WhatsApp),
+        "slack" => Some(ChannelType::Slack),
+        "webchat" => Some(ChannelType::WebChat),
+        _ => None,
+    }
+}
+
+/// Extract the value of a `key "value"` pattern from a string.
+fn extract_quoted_value(text: &str, key: &str) -> Option<String> {
+    let search = format!("{key} \"");
+    let start = text.find(&search)? + search.len();
+    let end = text[start..].find('"')? + start;
+    Some(text[start..end].to_string())
 }
 
 /// Parse markdown into sections keyed by lowercase heading text.
@@ -432,4 +590,74 @@ pub enum ConfigChangeEvent {
     IdentityReloaded,
     /// Full config reload (e.g., on initial load).
     FullReload,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const FULL_IDENTITY_MD: &str = r#"# Steward
+
+You are Steward.
+
+## Personality
+
+- Direct and concise
+
+## Behavioral Boundaries
+
+- Never share credentials
+
+## Owner
+
+- Name: Aniket
+- Telegram ID: 1430891255
+
+## Known Agents
+
+- Rook: AI assistant running on OpenClaw, sender_id "rook_agent" channel "webchat"
+"#;
+
+    #[test]
+    fn test_from_markdown_parses_owner() {
+        let config = IdentityConfig::from_markdown(FULL_IDENTITY_MD).unwrap();
+        let owner = config.owner.expect("owner should be parsed");
+        assert_eq!(owner.name, "Aniket");
+        assert_eq!(owner.telegram_id.as_deref(), Some("1430891255"));
+    }
+
+    #[test]
+    fn test_from_markdown_parses_known_agents() {
+        let config = IdentityConfig::from_markdown(FULL_IDENTITY_MD).unwrap();
+        assert_eq!(config.known_agents.len(), 1);
+        let agent = &config.known_agents[0];
+        assert_eq!(agent.name, "Rook");
+        assert_eq!(agent.sender_id, "rook_agent");
+        assert!(agent.description.contains("OpenClaw"));
+        assert_eq!(agent.channel, Some(ChannelType::WebChat));
+    }
+
+    #[test]
+    fn test_from_markdown_known_agent_no_channel_defaults_none() {
+        let md = "# Steward\n\n## Known Agents\n\n- Rook: description, sender_id \"rook_agent\"\n";
+        let config = IdentityConfig::from_markdown(md).unwrap();
+        assert_eq!(config.known_agents.len(), 1);
+        assert_eq!(config.known_agents[0].channel, None);
+    }
+
+    #[test]
+    fn test_from_markdown_no_owner_section() {
+        let md = "# Steward\n\n## Personality\n\n- Direct\n";
+        let config = IdentityConfig::from_markdown(md).unwrap();
+        assert!(config.owner.is_none());
+        assert!(config.known_agents.is_empty());
+    }
+
+    #[test]
+    fn test_from_markdown_preserves_existing_fields() {
+        let config = IdentityConfig::from_markdown(FULL_IDENTITY_MD).unwrap();
+        assert_eq!(config.name, "Steward");
+        assert!(!config.boundaries.is_empty());
+        assert!(!config.raw_markdown.is_empty());
+    }
 }

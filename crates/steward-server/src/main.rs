@@ -316,6 +316,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let agent_config = AgentConfig {
         model: cli.model.clone(),
         system_prompt,
+        owner: steward_config.identity.owner.clone(),
+        known_agents: steward_config.identity.known_agents.clone(),
         ..AgentConfig::default()
     };
 
