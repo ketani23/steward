@@ -322,29 +322,45 @@ impl TelegramAdapter {
         Ok(())
     }
 
-    /// Call `answerCallbackQuery` to acknowledge a button press.
-    async fn answer_callback_query(&self, callback_query_id: &str) -> Result<(), StewardError> {
-        let body = serde_json::json!({
-            "callback_query_id": callback_query_id,
+    /// Spawn a background task to acknowledge a button press via `answerCallbackQuery`.
+    ///
+    /// Fire-and-forget with a 5-second timeout so the approval decision path is
+    /// never blocked waiting for Telegram's ack endpoint.
+    fn spawn_answer_callback_query(&self, callback_query_id: String) {
+        let client = self.client.clone();
+        let url = self.config.api_url("answerCallbackQuery");
+        tokio::spawn(async move {
+            let body = serde_json::json!({
+                "callback_query_id": callback_query_id,
+            });
+
+            let result =
+                tokio::time::timeout(Duration::from_secs(5), client.post(url).json(&body).send())
+                    .await;
+
+            match result {
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        callback_query_id = %callback_query_id,
+                        "answerCallbackQuery timed out after 5s"
+                    );
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(
+                        callback_query_id = %callback_query_id,
+                        "answerCallbackQuery request failed: {e}"
+                    );
+                }
+                Ok(Ok(resp)) if !resp.status().is_success() => {
+                    let status = resp.status();
+                    tracing::warn!(
+                        callback_query_id = %callback_query_id,
+                        "answerCallbackQuery returned non-success status {status}"
+                    );
+                }
+                Ok(Ok(_)) => {}
+            }
         });
-
-        let resp = self
-            .client
-            .post(self.config.api_url("answerCallbackQuery"))
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| {
-                StewardError::Channel(format!("Telegram answerCallbackQuery failed: {e}"))
-            })?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_else(|_| "unknown".to_string());
-            tracing::warn!("answerCallbackQuery error {status}: {body}");
-        }
-
-        Ok(())
     }
 
     /// Process a single update: dispatch to the inbound channel or resolve a pending approval.
@@ -415,10 +431,9 @@ impl TelegramAdapter {
             return;
         }
 
-        // Acknowledge the callback query so the loading indicator disappears.
-        if let Err(e) = self.answer_callback_query(&cq.id).await {
-            tracing::warn!("Failed to answer callback query: {e}");
-        }
+        // Acknowledge the callback query in a background task so the loading
+        // spinner is dismissed without blocking the approval decision path.
+        self.spawn_answer_callback_query(cq.id.clone());
 
         let data = match &cq.data {
             Some(d) => d.as_str(),
@@ -694,35 +709,44 @@ impl TelegramPollingWorker {
 
     /// Acknowledge a callback query to dismiss the loading spinner in Telegram.
     ///
-    /// This is a fire-and-forget call — failures are logged as warnings but
-    /// do not affect the approval flow.
-    async fn answer_callback_query(&self, callback_query_id: &str) {
-        let body = serde_json::json!({
-            "callback_query_id": callback_query_id,
-        });
+    /// Spawned as a background task so the approval decision is delivered
+    /// immediately regardless of whether the ack HTTP call succeeds.
+    /// A 5-second timeout prevents the task from hanging indefinitely.
+    fn spawn_answer_callback_query(&self, callback_query_id: String) {
+        let client = self.client.clone();
+        let url = self.config.api_url("answerCallbackQuery");
+        tokio::spawn(async move {
+            let body = serde_json::json!({
+                "callback_query_id": callback_query_id,
+            });
 
-        match self
-            .client
-            .post(self.config.api_url("answerCallbackQuery"))
-            .json(&body)
-            .send()
-            .await
-        {
-            Ok(resp) if !resp.status().is_success() => {
-                let status = resp.status();
-                tracing::warn!(
-                    callback_query_id = %callback_query_id,
-                    "answerCallbackQuery returned non-success status {status}"
-                );
+            let result =
+                tokio::time::timeout(Duration::from_secs(5), client.post(url).json(&body).send())
+                    .await;
+
+            match result {
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        callback_query_id = %callback_query_id,
+                        "answerCallbackQuery timed out after 5s"
+                    );
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(
+                        callback_query_id = %callback_query_id,
+                        "answerCallbackQuery request failed: {e}"
+                    );
+                }
+                Ok(Ok(resp)) if !resp.status().is_success() => {
+                    let status = resp.status();
+                    tracing::warn!(
+                        callback_query_id = %callback_query_id,
+                        "answerCallbackQuery returned non-success status {status}"
+                    );
+                }
+                Ok(Ok(_)) => {}
             }
-            Err(e) => {
-                tracing::warn!(
-                    callback_query_id = %callback_query_id,
-                    "answerCallbackQuery request failed: {e}"
-                );
-            }
-            Ok(_) => {}
-        }
+        });
     }
 
     /// Handle a callback query (inline keyboard button press).
@@ -735,8 +759,9 @@ impl TelegramPollingWorker {
             return;
         }
 
-        // Always acknowledge the callback query so the loading spinner is dismissed.
-        self.answer_callback_query(&cq.id).await;
+        // Acknowledge the callback query in a background task so the loading
+        // spinner is dismissed without blocking the approval decision path.
+        self.spawn_answer_callback_query(cq.id.clone());
 
         let data = match &cq.data {
             Some(d) => d.as_str(),
