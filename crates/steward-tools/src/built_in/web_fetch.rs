@@ -6,12 +6,29 @@
 //! token overflow when feeding pages into the LLM context.
 //!
 //! Permission tier: LogAndExecute (arbitrary URL access, read-only, audited).
+//!
+//! # SSRF hardening
+//!
+//! Three layers of protection are applied:
+//!
+//! 1. **Scheme allowlist** — only `http` and `https` are permitted.
+//! 2. **IP range check** — every URL (including redirect `Location` headers) is
+//!    resolved via DNS and rejected if any resolved address falls in a private,
+//!    loopback, or link-local range.
+//! 3. **DNS pinning** — after validation the resolved address is passed to
+//!    `reqwest::ClientBuilder::resolve()`, so the actual TCP connection is made
+//!    to the IP that was validated, not whatever DNS returns at connect time.
+//!    This prevents DNS-rebinding / TOCTOU attacks.
+//!
+//! Redirects are followed manually (up to [`MAX_REDIRECTS`] hops) so that
+//! every hop is independently validated before the next request is sent.
 
-use std::net::{IpAddr, ToSocketAddrs};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use regex::Regex;
-use reqwest::Client;
+use reqwest::{redirect, Client};
 use serde::Deserialize;
 use tracing::{debug, warn};
 
@@ -28,6 +45,9 @@ const MAX_BODY_BYTES: usize = 1024 * 1024;
 
 /// Request timeout in seconds.
 const TIMEOUT_SECS: u64 = 30;
+
+/// Maximum number of redirects to follow per fetch.
+const MAX_REDIRECTS: u8 = 5;
 
 /// Returns `true` if `ip` falls in a private, loopback, or link-local range.
 ///
@@ -66,20 +86,12 @@ fn is_private_or_internal(ip: IpAddr) -> bool {
 ///
 /// Implements [`BuiltInHandler`] to be registered with the tool registry.
 /// For HTML responses, tags are stripped before returning content.
-pub struct WebFetchTool {
-    client: Client,
-}
+pub struct WebFetchTool;
 
 impl WebFetchTool {
     /// Create a new web fetch tool.
     pub fn new() -> Result<Self, StewardError> {
-        let client = Client::builder()
-            .timeout(std::time::Duration::from_secs(TIMEOUT_SECS))
-            .user_agent("Steward/0.1")
-            .build()
-            .map_err(|e| StewardError::Tool(format!("failed to build HTTP client: {e}")))?;
-
-        Ok(Self { client })
+        Ok(Self)
     }
 
     /// Return the [`ToolDefinition`] for this tool.
@@ -109,12 +121,15 @@ impl WebFetchTool {
         }
     }
 
-    /// Validate a URL against SSRF attack vectors.
+    /// Validate a URL against SSRF attack vectors and return the resolved socket address.
     ///
     /// Rejects:
     /// - Non-http/https schemes (e.g. `file://`, `ftp://`)
     /// - URLs that resolve to private, loopback, or link-local IP addresses
-    fn validate_url_safety(url: &str) -> Result<(), StewardError> {
+    ///
+    /// Returns the first safe resolved [`SocketAddr`] for use with DNS pinning
+    /// (`reqwest::ClientBuilder::resolve`).
+    fn validate_url_safety(url: &str) -> Result<SocketAddr, StewardError> {
         // Parse URL.
         let parsed = reqwest::Url::parse(url)
             .map_err(|e| StewardError::Tool(format!("invalid URL: {e}")))?;
@@ -136,12 +151,14 @@ impl WebFetchTool {
 
         // Resolve hostname to socket addresses via std::net.
         let port = parsed.port_or_known_default().unwrap_or(80);
-        let addrs = (host, port)
+        let addrs: Vec<SocketAddr> = (host, port)
             .to_socket_addrs()
-            .map_err(|e| StewardError::Tool(format!("failed to resolve host '{host}': {e}")))?;
+            .map_err(|e| StewardError::Tool(format!("failed to resolve host '{host}': {e}")))?
+            .collect();
 
-        // Block any resolution to a private or internal IP.
-        for addr in addrs {
+        // Block any resolution to a private or internal IP, and track the first safe addr.
+        let mut safe_addr: Option<SocketAddr> = None;
+        for addr in &addrs {
             let ip = addr.ip();
             if is_private_or_internal(ip) {
                 warn!(url = %url, ip = %ip, "blocked SSRF attempt to private/internal IP");
@@ -149,9 +166,13 @@ impl WebFetchTool {
                     "URL is blocked: resolves to a private or internal IP address ({ip})"
                 )));
             }
+            if safe_addr.is_none() {
+                safe_addr = Some(*addr);
+            }
         }
 
-        Ok(())
+        safe_addr
+            .ok_or_else(|| StewardError::Tool(format!("no addresses resolved for host '{host}'")))
     }
 
     /// Strip HTML tags from content and decode common HTML entities.
@@ -219,14 +240,18 @@ impl BuiltInHandler for WebFetchTool {
     /// Flow:
     /// 1. Parse `{"url": "...", "max_chars": N}` from JSON parameters
     /// 2. Reject empty URL
-    /// 3. Validate URL safety (SSRF protection: scheme + IP range check)
-    /// 4. Send GET request with a 30-second timeout
-    /// 5. Return error on non-2xx status
-    /// 6. Reject early if Content-Length exceeds 1 MiB
-    /// 7. Read body bytes with a 1 MiB hard cap
-    /// 8. Strip HTML tags if the content type is HTML
-    /// 9. Truncate to `max_chars` Unicode characters (default 8000)
-    /// 10. Return structured result with `text`, `url`, `truncated`, `content_type`
+    /// 3. For each request hop (initial + up to MAX_REDIRECTS redirects):
+    ///    a. Validate URL (SSRF: scheme allowlist + IP range check)
+    ///    b. Build a per-request client with pinned DNS (prevents rebinding) and no auto-redirects
+    ///    c. Send GET with a 30-second timeout
+    ///    d. On 3xx, extract and re-validate the Location URL, then loop
+    ///    e. On any other status, exit the loop
+    /// 4. Return error on non-2xx status
+    /// 5. Reject early if Content-Length exceeds 1 MiB
+    /// 6. Stream body chunk-by-chunk, aborting if total exceeds 1 MiB
+    /// 7. Strip HTML tags if the content type is HTML
+    /// 8. Truncate to `max_chars` Unicode characters (default 8000)
+    /// 9. Return structured result with `text`, `url`, `truncated`, `content_type`
     async fn execute(&self, parameters: serde_json::Value) -> Result<ToolResult, StewardError> {
         // 1. Parse parameters.
         let params: WebFetchParams = serde_json::from_value(parameters)
@@ -238,27 +263,79 @@ impl BuiltInHandler for WebFetchTool {
             return Err(StewardError::Tool("URL cannot be empty".to_string()));
         }
 
-        // 3. Validate URL safety (SSRF protection).
-        Self::validate_url_safety(&url)?;
-
         let max_chars = params.max_chars.unwrap_or(DEFAULT_MAX_CHARS);
 
-        debug!(url = %url, max_chars = max_chars, "fetching URL");
+        // 3. Manual redirect loop: validate + pin DNS at every hop.
+        let mut current_url = url;
+        let mut redirect_count = 0u8;
 
-        // 4. Send GET request.
-        let response = self.client.get(&url).send().await.map_err(|e| {
-            warn!(error = %e, url = %url, "web fetch request failed");
-            StewardError::Tool(format!("failed to fetch URL '{url}': {e}"))
-        })?;
+        let response = loop {
+            // Validate URL safety and get the resolved address for DNS pinning.
+            let resolved_addr = Self::validate_url_safety(&current_url)?;
 
-        // 5. Return error on non-2xx status.
+            // Safety: URL was successfully parsed inside `validate_url_safety` above.
+            let parsed = reqwest::Url::parse(&current_url).unwrap();
+            let host = parsed.host_str().unwrap().to_string();
+
+            debug!(url = %current_url, ip = %resolved_addr, "fetching URL");
+
+            // Build a per-request client with pinned DNS and no auto-redirects.
+            // `resolve()` pins the hostname to the validated IP so that a second
+            // DNS lookup cannot swap in a private address (DNS rebinding / TOCTOU).
+            let client = Client::builder()
+                .timeout(Duration::from_secs(TIMEOUT_SECS))
+                .user_agent("Steward/0.1")
+                .redirect(redirect::Policy::none())
+                .resolve(&host, resolved_addr)
+                .build()
+                .map_err(|e| StewardError::Tool(format!("failed to build HTTP client: {e}")))?;
+
+            let response = client.get(&current_url).send().await.map_err(|e| {
+                warn!(error = %e, url = %current_url, "web fetch request failed");
+                StewardError::Tool(format!("failed to fetch URL '{current_url}': {e}"))
+            })?;
+
+            if response.status().is_redirection() {
+                if redirect_count >= MAX_REDIRECTS {
+                    return Err(StewardError::Tool(format!(
+                        "too many redirects (max {MAX_REDIRECTS})"
+                    )));
+                }
+
+                let location = response
+                    .headers()
+                    .get(reqwest::header::LOCATION)
+                    .ok_or_else(|| {
+                        StewardError::Tool("redirect with no Location header".to_string())
+                    })?
+                    .to_str()
+                    .map_err(|_| {
+                        StewardError::Tool("invalid Location header encoding".to_string())
+                    })?;
+
+                // Resolve relative redirects against the current URL.
+                let new_url = parsed
+                    .join(location)
+                    .map_err(|e| StewardError::Tool(format!("invalid redirect URL: {e}")))?;
+
+                current_url = new_url.to_string();
+                redirect_count += 1;
+                continue;
+            }
+
+            break response;
+        };
+
+        let final_url = current_url;
+
+        // 4. Return error on non-2xx status.
         let status = response.status();
         if !status.is_success() {
             return Ok(ToolResult {
                 success: false,
                 output: serde_json::json!({
-                    "error": format!("HTTP {status} fetching '{url}'"),
-                    "url": url,
+                    "error": format!("HTTP {status} fetching '{final_url}'"),
+                    "url": final_url,
                 }),
                 error: Some(format!("HTTP error {status}")),
             });
@@ -271,7 +348,7 @@ impl BuiltInHandler for WebFetchTool {
             .unwrap_or("")
             .to_lowercase();
 
-        // 6. Reject oversized responses early using Content-Length header.
+        // 5. Reject oversized responses early using Content-Length header.
         if let Some(content_length) = response.content_length() {
             if content_length as usize > MAX_BODY_BYTES {
                 return Err(StewardError::Tool(format!(
@@ -280,21 +357,27 @@ impl BuiltInHandler for WebFetchTool {
             }
         }
 
-        // 7. Read body bytes with a hard 1 MiB cap.
-        let body_bytes = response
-            .bytes()
+        // 6. Stream body chunk-by-chunk with a hard 1 MiB cap.
+        // Using `chunk()` instead of `bytes()` prevents buffering the entire body
+        // in memory before the size check fires.
+        let mut body_bytes: Vec<u8> = Vec::new();
+        let mut response = response;
+        while let Some(chunk) = response
+            .chunk()
             .await
-            .map_err(|e| StewardError::Tool(format!("failed to read response body: {e}")))?;
-
-        if body_bytes.len() > MAX_BODY_BYTES {
-            return Err(StewardError::Tool(
-                "response body exceeds 1 MiB limit".to_string(),
-            ));
+            .map_err(|e| StewardError::Tool(format!("failed to read response body: {e}")))?
+        {
+            if body_bytes.len() + chunk.len() > MAX_BODY_BYTES {
+                return Err(StewardError::Tool(
+                    "response body exceeds 1 MiB limit".to_string(),
+                ));
+            }
+            body_bytes.extend_from_slice(&chunk);
         }
 
         let body = String::from_utf8_lossy(&body_bytes).into_owned();
 
-        // 8. Strip HTML if applicable.
+        // 7. Strip HTML if applicable.
         let is_html = content_type.contains("text/html") || content_type.is_empty();
         let text = if is_html {
             Self::strip_html(&body)
@@ -302,15 +385,15 @@ impl BuiltInHandler for WebFetchTool {
             body
         };
 
-        // 9. Truncate to max_chars Unicode characters.
+        // 8. Truncate to max_chars Unicode characters.
         let (text, truncated) = Self::truncate(text, max_chars);
 
-        // 10. Return structured result.
+        // 9. Return structured result.
         Ok(ToolResult {
             success: true,
             output: serde_json::json!({
                 "text": text,
-                "url": url,
+                "url": final_url,
                 "truncated": truncated,
                 "content_type": content_type,
             }),

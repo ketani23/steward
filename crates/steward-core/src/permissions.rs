@@ -410,8 +410,8 @@ mod tests {
         let engine = YamlPermissionEngine::new(file.path()).unwrap();
         let manifest = engine.manifest.try_read().unwrap();
 
-        assert_eq!(manifest.auto_execute.patterns.len(), 5);
-        assert_eq!(manifest.log_and_execute.patterns.len(), 6);
+        assert_eq!(manifest.auto_execute.patterns.len(), 4);
+        assert_eq!(manifest.log_and_execute.patterns.len(), 7);
         assert_eq!(manifest.human_approval.patterns.len(), 8);
         assert_eq!(manifest.forbidden.patterns.len(), 5);
     }
@@ -497,10 +497,6 @@ mod tests {
             engine.classify(&make_proposal("memory.search")),
             PermissionTier::AutoExecute
         );
-        assert_eq!(
-            engine.classify(&make_proposal("web.search")),
-            PermissionTier::AutoExecute
-        );
     }
 
     #[test]
@@ -526,6 +522,14 @@ mod tests {
         );
         assert_eq!(
             engine.classify(&make_proposal("shell.exec.readonly")),
+            PermissionTier::LogAndExecute
+        );
+        assert_eq!(
+            engine.classify(&make_proposal("web.search")),
+            PermissionTier::LogAndExecute
+        );
+        assert_eq!(
+            engine.classify(&make_proposal("web.fetch")),
             PermissionTier::LogAndExecute
         );
     }
