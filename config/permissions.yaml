@@ -21,6 +21,7 @@ tiers:
       - note.create
       - message.draft
       - file.read
+      - web.fetch
       # Safe, read-only shell commands that do not modify system state.
       # These require the ShellTool to emit "shell.exec.readonly" as its tool_name
       # when the requested command matches the safe list (date, whoami, uname, ls,
