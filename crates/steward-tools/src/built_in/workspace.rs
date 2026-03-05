@@ -62,6 +62,49 @@ pub fn validate_write_path(requested: &str, workspace: &Path) -> Result<PathBuf,
     Ok(final_path)
 }
 
+/// Open a file for reading with `O_NOFOLLOW` to prevent TOCTOU symlink attacks.
+///
+/// If a symlink is swapped in at `path` between the path-validation check and
+/// the actual open call, `O_NOFOLLOW` causes the kernel to return `ELOOP`
+/// immediately rather than following the link.
+#[cfg(unix)]
+pub fn open_file_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+}
+
+/// Fallback for non-Unix platforms where `O_NOFOLLOW` is unavailable.
+#[cfg(not(unix))]
+pub fn open_file_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::File::open(path)
+}
+
+/// Write `content` to `path` with `O_NOFOLLOW | O_CREAT | O_TRUNC` to prevent
+/// TOCTOU symlink attacks.
+///
+/// Returns `ELOOP` if the final path component is a symbolic link.
+#[cfg(unix)]
+pub fn write_file_no_follow(path: &Path, content: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    file.write_all(content)
+}
+
+/// Fallback for non-Unix platforms.
+#[cfg(not(unix))]
+pub fn write_file_no_follow(path: &Path, content: &[u8]) -> std::io::Result<()> {
+    std::fs::write(path, content)
+}
+
 // ──────────────────────────── internal helpers ────────────────────────────
 
 /// Canonicalize the workspace root.  If the workspace directory does not yet
@@ -327,6 +370,76 @@ mod tests {
             err.to_string().contains("outside workspace"),
             "symlink parent escape should be rejected, got: {err}"
         );
+    }
+
+    // ── open_file_no_follow / write_file_no_follow ────────────────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn test_open_file_no_follow_accepts_regular_file() {
+        let (_tmp, ws) = make_workspace();
+        let file = ws.join("regular.txt");
+        fs::write(&file, "data").unwrap();
+
+        let result = open_file_no_follow(&file);
+        assert!(
+            result.is_ok(),
+            "regular file must be openable: {:?}",
+            result
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_open_file_no_follow_rejects_symlink() {
+        let (_tmp, ws) = make_workspace();
+        let target = ws.join("real.txt");
+        fs::write(&target, "data").unwrap();
+
+        let link = ws.join("link.txt");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        // O_NOFOLLOW must refuse to open the symlink (final component is a symlink).
+        let result = open_file_no_follow(&link);
+        assert!(
+            result.is_err(),
+            "O_NOFOLLOW should reject opening a symlink directly"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_write_file_no_follow_accepts_regular_path() {
+        let (_tmp, ws) = make_workspace();
+        let file = ws.join("out.txt");
+
+        let result = write_file_no_follow(&file, b"hello");
+        assert!(
+            result.is_ok(),
+            "writing to a regular path must succeed: {:?}",
+            result
+        );
+        assert_eq!(fs::read(&file).unwrap(), b"hello");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_write_file_no_follow_rejects_symlink() {
+        let (_tmp, ws) = make_workspace();
+        let target = ws.join("real.txt");
+        fs::write(&target, "original").unwrap();
+
+        let link = ws.join("link.txt");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        // O_NOFOLLOW must refuse to write through a symlink final component.
+        let result = write_file_no_follow(&link, b"evil");
+        assert!(
+            result.is_err(),
+            "O_NOFOLLOW should reject writing through a symlink"
+        );
+        // Verify the original file was not modified.
+        assert_eq!(fs::read_to_string(&target).unwrap(), "original");
     }
 
     // ── normalize_lexical ─────────────────────────────────────────────────

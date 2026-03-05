@@ -18,7 +18,9 @@ use tracing::debug;
 use steward_types::actions::{PermissionTier, ToolDefinition, ToolResult, ToolSource};
 use steward_types::errors::StewardError;
 
-use crate::built_in::workspace::{validate_path, workspace_root};
+use crate::built_in::workspace::{
+    open_file_no_follow, validate_path, workspace_root, write_file_no_follow,
+};
 use crate::registry::BuiltInHandler;
 
 /// File edit tool — performs an exact text replacement within a workspace file.
@@ -104,10 +106,23 @@ impl BuiltInHandler for FileEditTool {
 
         debug!(path = %safe_path.display(), "file.edit executing");
 
-        // 3. Read file contents.
-        let original = tokio::fs::read_to_string(&safe_path)
+        // 3. Read file with O_NOFOLLOW to close the TOCTOU window between
+        //    validate_path and the actual open syscall.
+        let original = {
+            let path = safe_path.clone();
+            let display = params.path.clone();
+            tokio::task::spawn_blocking(move || {
+                use std::io::Read as _;
+                let mut file = open_file_no_follow(&path)
+                    .map_err(|e| StewardError::Tool(format!("cannot read {display}: {e}")))?;
+                let mut s = String::new();
+                file.read_to_string(&mut s)
+                    .map_err(|e| StewardError::Tool(format!("cannot read {display}: {e}")))?;
+                Ok::<String, StewardError>(s)
+            })
             .await
-            .map_err(|e| StewardError::Tool(format!("cannot read {}: {e}", params.path)))?;
+            .map_err(|e| StewardError::Tool(format!("cannot read {}: {e}", params.path)))?
+        }?;
 
         // 4. Count occurrences.
         let count = original.matches(params.old_text.as_str()).count();
@@ -126,11 +141,19 @@ impl BuiltInHandler for FileEditTool {
             )));
         }
 
-        // 6. Replace and write.
+        // 6. Replace and write with O_NOFOLLOW.
         let modified = original.replacen(params.old_text.as_str(), &params.new_text, 1);
-        tokio::fs::write(&safe_path, &modified)
+        {
+            let path = safe_path;
+            let display = params.path.clone();
+            let content = modified.into_bytes();
+            tokio::task::spawn_blocking(move || {
+                write_file_no_follow(&path, &content)
+                    .map_err(|e| StewardError::Tool(format!("cannot write {display}: {e}")))
+            })
             .await
-            .map_err(|e| StewardError::Tool(format!("cannot write {}: {e}", params.path)))?;
+            .map_err(|e| StewardError::Tool(format!("cannot write {}: {e}", params.path)))?
+        }?;
 
         // 7. Return confirmation.
         Ok(ToolResult {

@@ -18,7 +18,7 @@ use tracing::debug;
 use steward_types::actions::{PermissionTier, ToolDefinition, ToolResult, ToolSource};
 use steward_types::errors::StewardError;
 
-use crate::built_in::workspace::{validate_path, workspace_root};
+use crate::built_in::workspace::{open_file_no_follow, validate_path, workspace_root};
 use crate::registry::BuiltInHandler;
 
 /// Default number of lines returned when the caller does not specify a limit.
@@ -120,11 +120,17 @@ impl BuiltInHandler for FileReadTool {
             .unwrap_or(DEFAULT_LINE_LIMIT)
             .min(MAX_LINE_LIMIT);
 
-        // 3. Stream file line-by-line — avoids loading the whole file into memory.
-        //    A 10 GB file with limit=10 only ever reads 10+skip lines.
-        let file = tokio::fs::File::open(&safe_path)
-            .await
-            .map_err(|e| StewardError::Tool(format!("cannot read {}: {e}", params.path)))?;
+        // 3. Open with O_NOFOLLOW to close the TOCTOU window between validate_path
+        //    and the actual open syscall.  If a symlink is swapped in at safe_path
+        //    between validation and open, the kernel returns ELOOP immediately.
+        let std_file = tokio::task::spawn_blocking({
+            let path = safe_path;
+            move || open_file_no_follow(&path)
+        })
+        .await
+        .map_err(|e| StewardError::Tool(format!("cannot read {}: {e}", params.path)))?
+        .map_err(|e| StewardError::Tool(format!("cannot read {}: {e}", params.path)))?;
+        let file = tokio::fs::File::from_std(std_file);
         let reader = tokio::io::BufReader::new(file);
         let mut lines_iter = reader.lines();
 
@@ -153,9 +159,19 @@ impl BuiltInHandler for FileReadTool {
         }
 
         let lines_returned = collected.len();
-        // `truncated` is true when we stopped early due to the limit.
-        // `total_lines` reflects lines read up to the stopping point.
-        let truncated = lines_returned >= limit;
+        // Peek one more line to distinguish "hit the limit with more content
+        // remaining" from "file had exactly `limit` lines".  The previous
+        // `lines_returned >= limit` check produced a false positive when the
+        // file size was an exact multiple of the limit.
+        let truncated = if lines_returned >= limit {
+            lines_iter
+                .next_line()
+                .await
+                .map(|opt| opt.is_some())
+                .unwrap_or(false)
+        } else {
+            false
+        };
         let total_lines = skip + lines_returned;
         let content = collected.join("\n");
 
@@ -258,6 +274,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_exact_limit_not_truncated() {
+        let tmp = tempfile::tempdir().unwrap();
+        // File has exactly 3 lines; reading with limit=3 must NOT report truncated.
+        let lines: String = (1..=3).map(|i| format!("line{i}\n")).collect();
+        fs::write(tmp.path().join("exact.txt"), &lines).unwrap();
+
+        let result = tool(tmp.path())
+            .execute(serde_json::json!({"path": "exact.txt", "limit": 3}))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert_eq!(result.output["lines_returned"], 3);
+        assert_eq!(
+            result.output["truncated"], false,
+            "file with exactly limit lines must not be reported as truncated"
+        );
+    }
+
+    #[tokio::test]
     async fn test_full_file_not_truncated() {
         let tmp = tempfile::tempdir().unwrap();
         let file = tmp.path().join("small.txt");
@@ -295,6 +331,28 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("outside workspace"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_symlink_rejected_by_nofollow() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real.txt");
+        fs::write(&real, "data").unwrap();
+
+        // Symlink within workspace pointing to a real file within workspace.
+        // validate_path resolves this to the real path; O_NOFOLLOW then guards
+        // against a race where the real path itself is swapped for a symlink.
+        // We test the helper directly: open_file_no_follow must reject symlinks.
+        let link = tmp.path().join("link.txt");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        // Opening the symlink directly (as O_NOFOLLOW sees it) must fail.
+        let result = open_file_no_follow(&link);
+        assert!(
+            result.is_err(),
+            "O_NOFOLLOW must reject a symlink final component"
+        );
     }
 
     #[tokio::test]

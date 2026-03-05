@@ -195,12 +195,16 @@ fn collect_entries(
         // Use symlink_metadata (lstat) to inspect the entry WITHOUT following symlinks.
         let symlink_meta = fs::symlink_metadata(&entry_path)?;
 
-        // Display path relative to root.
-        let rel = entry_path
-            .strip_prefix(root)
-            .unwrap_or(&entry_path)
-            .to_string_lossy()
-            .into_owned();
+        // Display path relative to root.  If strip_prefix fails (should not
+        // happen since entry_path is always under root, but guard anyway) fall
+        // back to just the filename to avoid leaking the absolute path.
+        let rel = match entry_path.strip_prefix(root) {
+            Ok(r) => r.to_string_lossy().into_owned(),
+            Err(_) => entry_path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+        };
 
         if symlink_meta.file_type().is_symlink() {
             // Resolve the symlink target and verify it stays within the workspace.
