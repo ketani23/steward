@@ -411,8 +411,8 @@ mod tests {
         let manifest = engine.manifest.try_read().unwrap();
 
         assert_eq!(manifest.auto_execute.patterns.len(), 4);
-        assert_eq!(manifest.log_and_execute.patterns.len(), 7);
-        assert_eq!(manifest.human_approval.patterns.len(), 8);
+        assert_eq!(manifest.log_and_execute.patterns.len(), 8);
+        assert_eq!(manifest.human_approval.patterns.len(), 9);
         assert_eq!(manifest.forbidden.patterns.len(), 5);
     }
 

@@ -37,7 +37,12 @@ use steward_security::audit::{self, InMemoryAuditLogger, PostgresAuditLogger};
 use steward_security::egress::{EgressFilterConfig, EgressFilterImpl};
 use steward_security::ingress::{DefaultIngressSanitizer, IngressSanitizerConfig};
 use steward_security::leak_detector::PatternLeakDetector;
+use steward_tools::built_in::file_edit::FileEditTool;
+use steward_tools::built_in::file_list::FileListTool;
+use steward_tools::built_in::file_read::FileReadTool;
+use steward_tools::built_in::file_write::FileWriteTool;
 use steward_tools::built_in::shell::{ShellConfig, ShellTool};
+use steward_tools::built_in::workspace::workspace_root;
 use steward_tools::registry::ToolRegistryImpl;
 use steward_types::actions::{ChannelType, InboundMessage, OutboundMessage};
 use steward_types::config::IdentityConfig;
@@ -248,12 +253,39 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         },
     ));
 
-    // ── 6. Tool registry + shell tool ───────────────────────────
+    // ── 6. Tool registry + built-in tools ───────────────────────
     let tools = Arc::new(ToolRegistryImpl::new());
     tools
         .register_built_in(
             ShellTool::tool_definition(),
             Arc::new(ShellTool::new(ShellConfig::default())),
+        )
+        .await?;
+
+    // File tools — workspace path from STEWARD_WORKSPACE env var or current dir.
+    let workspace = workspace_root();
+    tools
+        .register_built_in(
+            FileReadTool::tool_definition(),
+            Arc::new(FileReadTool::new(workspace.clone())),
+        )
+        .await?;
+    tools
+        .register_built_in(
+            FileWriteTool::tool_definition(),
+            Arc::new(FileWriteTool::new(workspace.clone())),
+        )
+        .await?;
+    tools
+        .register_built_in(
+            FileListTool::tool_definition(),
+            Arc::new(FileListTool::new(workspace.clone())),
+        )
+        .await?;
+    tools
+        .register_built_in(
+            FileEditTool::tool_definition(),
+            Arc::new(FileEditTool::new(workspace)),
         )
         .await?;
 
