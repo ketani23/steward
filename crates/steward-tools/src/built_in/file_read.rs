@@ -12,6 +12,7 @@ use std::path::PathBuf;
 
 use async_trait::async_trait;
 use serde::Deserialize;
+use tokio::io::AsyncBufReadExt as _;
 use tracing::debug;
 
 use steward_types::actions::{PermissionTier, ToolDefinition, ToolResult, ToolSource};
@@ -20,8 +21,14 @@ use steward_types::errors::StewardError;
 use crate::built_in::workspace::{validate_path, workspace_root};
 use crate::registry::BuiltInHandler;
 
-/// Default maximum number of lines returned when no limit is specified.
-const DEFAULT_LINE_LIMIT: usize = 200;
+/// Default number of lines returned when the caller does not specify a limit.
+const DEFAULT_LINE_LIMIT: usize = 1000;
+
+/// Absolute maximum lines that can be returned in a single call.
+///
+/// Even if the caller passes `limit=9999999`, the response is capped here,
+/// keeping peak memory bounded regardless of file size.
+const MAX_LINE_LIMIT: usize = 50_000;
 
 /// File read tool — reads text files within the workspace.
 ///
@@ -60,12 +67,12 @@ impl FileReadTool {
                         "description": "Path to the file, relative to the workspace root."
                     },
                     "offset": {
-                        "type": "number",
+                        "type": "integer",
                         "description": "Line number (1-based) to start reading from. Defaults to 1."
                     },
                     "limit": {
-                        "type": "number",
-                        "description": "Maximum number of lines to return. Defaults to 200."
+                        "type": "integer",
+                        "description": "Maximum number of lines to return. Defaults to 1000."
                     }
                 },
                 "required": ["path"]
@@ -106,23 +113,51 @@ impl BuiltInHandler for FileReadTool {
 
         debug!(path = %safe_path.display(), "file.read executing");
 
-        // 3. Read file contents.
-        let raw = tokio::fs::read_to_string(&safe_path)
+        // offset is 1-based; convert to 0-based skip count.
+        let skip = params.offset.unwrap_or(1).saturating_sub(1);
+        let limit = params
+            .limit
+            .unwrap_or(DEFAULT_LINE_LIMIT)
+            .min(MAX_LINE_LIMIT);
+
+        // 3. Stream file line-by-line — avoids loading the whole file into memory.
+        //    A 10 GB file with limit=10 only ever reads 10+skip lines.
+        let file = tokio::fs::File::open(&safe_path)
             .await
             .map_err(|e| StewardError::Tool(format!("cannot read {}: {e}", params.path)))?;
+        let reader = tokio::io::BufReader::new(file);
+        let mut lines_iter = reader.lines();
 
-        // 4. Apply offset and limit.
-        let all_lines: Vec<&str> = raw.lines().collect();
-        let total_lines = all_lines.len();
+        // 4. Apply offset and limit during reading.
+        let mut skipped: usize = 0;
+        let mut collected: Vec<String> = Vec::new();
 
-        // offset is 1-based; convert to 0-based index.
-        let skip = params.offset.unwrap_or(1).saturating_sub(1);
-        let limit = params.limit.unwrap_or(DEFAULT_LINE_LIMIT);
+        loop {
+            let line = lines_iter
+                .next_line()
+                .await
+                .map_err(|e| StewardError::Tool(format!("cannot read {}: {e}", params.path)))?;
 
-        let sliced: Vec<&str> = all_lines.iter().skip(skip).take(limit).copied().collect();
-        let truncated = (skip + sliced.len()) < total_lines;
+            let Some(line) = line else { break };
 
-        let content = sliced.join("\n");
+            if skipped < skip {
+                skipped += 1;
+                continue;
+            }
+
+            collected.push(line);
+
+            if collected.len() >= limit {
+                break; // Stop reading early — do not load the remainder into memory.
+            }
+        }
+
+        let lines_returned = collected.len();
+        // `truncated` is true when we stopped early due to the limit.
+        // `total_lines` reflects lines read up to the stopping point.
+        let truncated = lines_returned >= limit;
+        let total_lines = skip + lines_returned;
+        let content = collected.join("\n");
 
         // 5. Return structured result.
         Ok(ToolResult {
@@ -131,7 +166,7 @@ impl BuiltInHandler for FileReadTool {
                 "content": content,
                 "path": params.path,
                 "total_lines": total_lines,
-                "lines_returned": sliced.len(),
+                "lines_returned": lines_returned,
                 "offset": skip + 1,
                 "truncated": truncated,
             }),

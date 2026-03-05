@@ -68,7 +68,7 @@ impl FileListTool {
                         "description": "Whether to recurse into sub-directories. Default: false."
                     },
                     "max_depth": {
-                        "type": "number",
+                        "type": "integer",
                         "description": "Maximum recursion depth when recursive is true. Default: 3."
                     }
                 },
@@ -114,13 +114,11 @@ impl BuiltInHandler for FileListTool {
             .map_err(|e| StewardError::Tool(format!("invalid file.list parameters: {e}")))?;
 
         // 2. Validate or default path.
+        let canonical_workspace = std::fs::canonicalize(&self.workspace)
+            .map_err(|e| StewardError::Tool(format!("cannot resolve workspace: {e}")))?;
         let target_dir = match &params.path {
             Some(p) if !p.is_empty() => validate_path(p, &self.workspace)?,
-            _ => {
-                // Default to workspace root itself.
-                std::fs::canonicalize(&self.workspace)
-                    .map_err(|e| StewardError::Tool(format!("cannot resolve workspace: {e}")))?
-            }
+            _ => canonical_workspace.clone(),
         };
 
         if !target_dir.is_dir() {
@@ -140,6 +138,7 @@ impl BuiltInHandler for FileListTool {
         collect_entries(
             &target_dir,
             &target_dir,
+            &canonical_workspace,
             recursive,
             0,
             max_depth,
@@ -175,9 +174,13 @@ impl BuiltInHandler for FileListTool {
 ///
 /// `root` is the top-level directory being listed (for computing relative
 /// display paths).  `current` is the directory being scanned at this call.
+/// `workspace` is the canonicalized workspace root used for the symlink
+/// boundary check — symlinks whose resolved targets fall outside it are
+/// skipped and noted in the listing.
 fn collect_entries(
     root: &Path,
     current: &Path,
+    workspace: &Path,
     recursive: bool,
     depth: usize,
     max_depth: usize,
@@ -188,7 +191,9 @@ fn collect_entries(
     for entry_result in read_dir {
         let entry = entry_result?;
         let entry_path = entry.path();
-        let metadata = entry.metadata()?;
+
+        // Use symlink_metadata (lstat) to inspect the entry WITHOUT following symlinks.
+        let symlink_meta = fs::symlink_metadata(&entry_path)?;
 
         // Display path relative to root.
         let rel = entry_path
@@ -197,20 +202,74 @@ fn collect_entries(
             .to_string_lossy()
             .into_owned();
 
-        if metadata.is_dir() {
+        if symlink_meta.file_type().is_symlink() {
+            // Resolve the symlink target and verify it stays within the workspace.
+            match fs::canonicalize(&entry_path) {
+                Ok(resolved) if resolved.starts_with(workspace) => {
+                    // Safe: symlink target is inside the workspace.
+                    if resolved.is_dir() {
+                        out.push(Entry {
+                            display: format!("{rel}/"),
+                            kind: 'd',
+                            size: 0,
+                        });
+                        if recursive && depth < max_depth {
+                            collect_entries(
+                                root,
+                                &resolved,
+                                workspace,
+                                recursive,
+                                depth + 1,
+                                max_depth,
+                                out,
+                            )?;
+                        }
+                    } else {
+                        let size = fs::metadata(&entry_path).map(|m| m.len()).unwrap_or(0);
+                        out.push(Entry {
+                            display: rel,
+                            kind: '-',
+                            size,
+                        });
+                    }
+                }
+                _ => {
+                    // Symlink escapes the workspace or cannot be resolved — skip it.
+                    out.push(Entry {
+                        display: format!("{rel} (symlink outside workspace, skipped)"),
+                        kind: '-',
+                        size: 0,
+                    });
+                }
+            }
+        } else if symlink_meta.is_dir() {
             out.push(Entry {
                 display: format!("{rel}/"),
                 kind: 'd',
                 size: 0,
             });
             if recursive && depth < max_depth {
-                collect_entries(root, &entry_path, recursive, depth + 1, max_depth, out)?;
+                // Canonicalize before recursing to guard against TOCTOU races.
+                match fs::canonicalize(&entry_path) {
+                    Ok(canonical) if canonical.starts_with(workspace) => {
+                        collect_entries(
+                            root,
+                            &canonical,
+                            workspace,
+                            recursive,
+                            depth + 1,
+                            max_depth,
+                            out,
+                        )?;
+                    }
+                    _ => {} // Resolved outside workspace — skip.
+                }
             }
         } else {
             out.push(Entry {
                 display: rel,
                 kind: '-',
-                size: metadata.len(),
+                size: symlink_meta.len(),
             });
         }
     }
@@ -379,6 +438,47 @@ mod tests {
     }
 
     // ── security ─────────────────────────────────────────────────────────
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_recursive_symlink_escape_not_followed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+
+        // Create a file outside the workspace.
+        fs::write(outside.path().join("secret.txt"), "secret content").unwrap();
+
+        // Symlink inside workspace pointing to a directory outside workspace.
+        std::os::unix::fs::symlink(outside.path(), tmp.path().join("evil_link")).unwrap();
+
+        let result = tool(tmp.path())
+            .execute(serde_json::json!({"recursive": true}))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        let listing = result.output["listing"].as_str().unwrap();
+        // Must not expose any file from outside the workspace.
+        assert!(
+            !listing.contains("secret.txt"),
+            "symlink escape: secret.txt must not appear in listing: {listing}"
+        );
+        // The symlink itself should be noted as skipped.
+        assert!(
+            listing.contains("evil_link") && listing.contains("symlink outside workspace"),
+            "expected symlink note in listing: {listing}"
+        );
+    }
+
+    #[test]
+    fn test_tool_definition_permission_tier_is_log_and_execute() {
+        let def = FileListTool::tool_definition();
+        assert_eq!(
+            def.permission_tier,
+            PermissionTier::LogAndExecute,
+            "file.list must not require human approval"
+        );
+    }
 
     #[tokio::test]
     async fn test_traversal_dotdot_rejected() {
