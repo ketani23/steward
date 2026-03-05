@@ -59,8 +59,10 @@ const MAX_REDIRECTS: u8 = 5;
 /// - 169.254.0.0/16 — link-local / cloud IMDS
 ///
 /// Blocked IPv6 ranges:
-/// - ::1       — loopback
-/// - fc00::/7  — ULA (unique local)
+/// - ::1             — loopback
+/// - fc00::/7        — ULA (unique local)
+/// - fe80::/10       — link-local
+/// - ::ffff:0:0/96   — IPv4-mapped (checked recursively against IPv4 ranges above)
 fn is_private_or_internal(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
@@ -74,10 +76,17 @@ fn is_private_or_internal(ip: IpAddr) -> bool {
                 || (o[0] == 169 && o[1] == 254)
         }
         IpAddr::V6(v6) => {
+            // IPv4-mapped addresses (::ffff:0:0/96): unwrap the inner IPv4 and
+            // recheck it against all IPv4 private ranges.  This prevents bypasses
+            // via e.g. ::ffff:127.0.0.1 or ::ffff:169.254.169.254.
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_private_or_internal(IpAddr::V4(v4));
+            }
             v6.is_loopback()
                 || v6.is_unspecified()
                 || v6.is_multicast()
-                || (v6.segments()[0] & 0xfe00) == 0xfc00
+                || (v6.segments()[0] & 0xfe00) == 0xfc00 // ULA fc00::/7
+                || (v6.segments()[0] & 0xffc0) == 0xfe80 // link-local fe80::/10
         }
     }
 }
@@ -129,7 +138,10 @@ impl WebFetchTool {
     ///
     /// Returns the first safe resolved [`SocketAddr`] for use with DNS pinning
     /// (`reqwest::ClientBuilder::resolve`).
-    fn validate_url_safety(url: &str) -> Result<SocketAddr, StewardError> {
+    ///
+    /// The DNS resolution step runs in a `spawn_blocking` thread so it does not
+    /// stall the async runtime.
+    async fn validate_url_safety(url: &str) -> Result<SocketAddr, StewardError> {
         // Parse URL.
         let parsed = reqwest::Url::parse(url)
             .map_err(|e| StewardError::Tool(format!("invalid URL: {e}")))?;
@@ -144,17 +156,24 @@ impl WebFetchTool {
             }
         }
 
-        // Extract hostname.
+        // Extract hostname (owned so it can cross the spawn_blocking boundary).
         let host = parsed
             .host_str()
-            .ok_or_else(|| StewardError::Tool("URL has no host".to_string()))?;
+            .ok_or_else(|| StewardError::Tool("URL has no host".to_string()))?
+            .to_string();
 
-        // Resolve hostname to socket addresses via std::net.
+        // Resolve hostname to socket addresses in a blocking thread to avoid
+        // stalling the async runtime (to_socket_addrs issues blocking syscalls).
         let port = parsed.port_or_known_default().unwrap_or(80);
-        let addrs: Vec<SocketAddr> = (host, port)
-            .to_socket_addrs()
-            .map_err(|e| StewardError::Tool(format!("failed to resolve host '{host}': {e}")))?
-            .collect();
+        let host_for_dns = host.clone();
+        let addrs: Vec<SocketAddr> = tokio::task::spawn_blocking(move || {
+            (host_for_dns.as_str(), port)
+                .to_socket_addrs()
+                .map(|iter| iter.collect::<Vec<_>>())
+        })
+        .await
+        .map_err(|e| StewardError::Tool(format!("DNS resolution task panicked: {e}")))?
+        .map_err(|e| StewardError::Tool(format!("failed to resolve host '{host}': {e}")))?;
 
         // Block any resolution to a private or internal IP, and track the first safe addr.
         let mut safe_addr: Option<SocketAddr> = None;
@@ -271,7 +290,7 @@ impl BuiltInHandler for WebFetchTool {
 
         let response = loop {
             // Validate URL safety and get the resolved address for DNS pinning.
-            let resolved_addr = Self::validate_url_safety(&current_url)?;
+            let resolved_addr = Self::validate_url_safety(&current_url).await?;
 
             // Safety: URL was successfully parsed inside `validate_url_safety` above.
             let parsed = reqwest::Url::parse(&current_url).unwrap();
@@ -433,64 +452,149 @@ mod tests {
 
     // ========== SSRF URL safety ==========
 
-    #[test]
-    fn test_ssrf_blocks_localhost() {
+    #[tokio::test]
+    async fn test_ssrf_blocks_localhost() {
         // localhost resolves to 127.0.0.1 via /etc/hosts
         assert!(
-            WebFetchTool::validate_url_safety("http://localhost/").is_err(),
+            WebFetchTool::validate_url_safety("http://localhost/")
+                .await
+                .is_err(),
             "localhost should be blocked"
         );
     }
 
-    #[test]
-    fn test_ssrf_blocks_127_0_0_1() {
+    #[tokio::test]
+    async fn test_ssrf_blocks_127_0_0_1() {
         assert!(
-            WebFetchTool::validate_url_safety("http://127.0.0.1/").is_err(),
+            WebFetchTool::validate_url_safety("http://127.0.0.1/")
+                .await
+                .is_err(),
             "127.0.0.1 should be blocked"
         );
     }
 
-    #[test]
-    fn test_ssrf_blocks_imds_169_254_169_254() {
+    #[tokio::test]
+    async fn test_ssrf_blocks_imds_169_254_169_254() {
         // AWS/GCP/Azure instance metadata service
         assert!(
-            WebFetchTool::validate_url_safety("http://169.254.169.254/latest/meta-data/").is_err(),
+            WebFetchTool::validate_url_safety("http://169.254.169.254/latest/meta-data/")
+                .await
+                .is_err(),
             "169.254.169.254 should be blocked"
         );
     }
 
-    #[test]
-    fn test_ssrf_blocks_private_10_range() {
-        assert!(WebFetchTool::validate_url_safety("http://10.0.0.1/").is_err());
+    #[tokio::test]
+    async fn test_ssrf_blocks_private_10_range() {
+        assert!(WebFetchTool::validate_url_safety("http://10.0.0.1/")
+            .await
+            .is_err());
     }
 
-    #[test]
-    fn test_ssrf_blocks_private_172_range() {
-        assert!(WebFetchTool::validate_url_safety("http://172.16.0.1/").is_err());
-        assert!(WebFetchTool::validate_url_safety("http://172.31.255.255/").is_err());
+    #[tokio::test]
+    async fn test_ssrf_blocks_private_172_range() {
+        assert!(WebFetchTool::validate_url_safety("http://172.16.0.1/")
+            .await
+            .is_err());
+        assert!(WebFetchTool::validate_url_safety("http://172.31.255.255/")
+            .await
+            .is_err());
     }
 
-    #[test]
-    fn test_ssrf_blocks_private_192_168_range() {
-        assert!(WebFetchTool::validate_url_safety("http://192.168.1.1/").is_err());
+    #[tokio::test]
+    async fn test_ssrf_blocks_private_192_168_range() {
+        assert!(WebFetchTool::validate_url_safety("http://192.168.1.1/")
+            .await
+            .is_err());
     }
 
-    #[test]
-    fn test_ssrf_blocks_file_scheme() {
-        assert!(WebFetchTool::validate_url_safety("file:///etc/passwd").is_err());
+    #[tokio::test]
+    async fn test_ssrf_blocks_file_scheme() {
+        assert!(WebFetchTool::validate_url_safety("file:///etc/passwd")
+            .await
+            .is_err());
     }
 
-    #[test]
-    fn test_ssrf_blocks_ftp_scheme() {
-        assert!(WebFetchTool::validate_url_safety("ftp://example.com/").is_err());
+    #[tokio::test]
+    async fn test_ssrf_blocks_ftp_scheme() {
+        assert!(WebFetchTool::validate_url_safety("ftp://example.com/")
+            .await
+            .is_err());
     }
 
-    #[test]
-    fn test_ssrf_allows_public_ip() {
+    #[tokio::test]
+    async fn test_ssrf_allows_public_ip() {
         // 1.1.1.1 is Cloudflare DNS — a known public IP
         assert!(
-            WebFetchTool::validate_url_safety("https://1.1.1.1/").is_ok(),
+            WebFetchTool::validate_url_safety("https://1.1.1.1/")
+                .await
+                .is_ok(),
             "public IP 1.1.1.1 should be allowed"
+        );
+    }
+
+    // IPv6 SSRF bypass vectors — validate_url_safety must block these.
+
+    #[tokio::test]
+    async fn test_ssrf_blocks_ipv6_mapped_loopback() {
+        // ::ffff:127.0.0.1 is an IPv4-mapped loopback address.
+        assert!(
+            WebFetchTool::validate_url_safety("http://[::ffff:127.0.0.1]/")
+                .await
+                .is_err(),
+            "IPv4-mapped loopback ::ffff:127.0.0.1 should be blocked"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ssrf_blocks_ipv6_mapped_private_10() {
+        // ::ffff:10.0.0.1 is an IPv4-mapped RFC-1918 address.
+        assert!(
+            WebFetchTool::validate_url_safety("http://[::ffff:10.0.0.1]/")
+                .await
+                .is_err(),
+            "IPv4-mapped RFC-1918 ::ffff:10.0.0.1 should be blocked"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ssrf_blocks_ipv6_mapped_imds() {
+        // ::ffff:169.254.169.254 targets the cloud IMDS via IPv4-mapped encoding.
+        assert!(
+            WebFetchTool::validate_url_safety("http://[::ffff:169.254.169.254]/")
+                .await
+                .is_err(),
+            "IPv4-mapped IMDS address should be blocked"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ssrf_blocks_ipv6_link_local() {
+        // fe80::1 is in the fe80::/10 link-local range.
+        assert!(
+            WebFetchTool::validate_url_safety("http://[fe80::1]/")
+                .await
+                .is_err(),
+            "IPv6 link-local fe80::1 should be blocked"
+        );
+    }
+
+    /// Validates the redirect-hop path: `validate_url_safety` is called for every
+    /// Location header URL during the manual redirect loop, so any redirect to a
+    /// private address is caught before the next connection is opened.
+    #[tokio::test]
+    async fn test_redirect_hop_private_url_is_rejected() {
+        assert!(
+            WebFetchTool::validate_url_safety("http://192.168.1.1/internal")
+                .await
+                .is_err(),
+            "redirect to private IP 192.168.1.1 must be blocked"
+        );
+        assert!(
+            WebFetchTool::validate_url_safety("http://[::ffff:10.0.0.1]/internal")
+                .await
+                .is_err(),
+            "redirect to IPv4-mapped RFC-1918 must be blocked"
         );
     }
 
@@ -533,6 +637,38 @@ mod tests {
     fn test_is_private_blocks_ipv6_ula() {
         // fc00::/7 covers fc00:: through fdff::
         let ip: IpAddr = "fd12:3456:789a:1::1".parse().unwrap();
+        assert!(is_private_or_internal(ip));
+    }
+
+    #[test]
+    fn test_is_private_blocks_ipv6_link_local() {
+        // fe80::/10 link-local range
+        let ip: IpAddr = "fe80::1".parse().unwrap();
+        assert!(is_private_or_internal(ip));
+        let ip: IpAddr = "febf::ffff".parse().unwrap();
+        assert!(is_private_or_internal(ip));
+    }
+
+    #[test]
+    fn test_is_private_blocks_ipv4_mapped_loopback() {
+        // ::ffff:127.0.0.1 — IPv4-mapped loopback
+        let ip: IpAddr = "::ffff:127.0.0.1".parse().unwrap();
+        assert!(is_private_or_internal(ip));
+    }
+
+    #[test]
+    fn test_is_private_blocks_ipv4_mapped_rfc1918() {
+        // ::ffff:10.0.0.1, ::ffff:172.16.0.1, ::ffff:192.168.0.1
+        for addr in &["::ffff:10.0.0.1", "::ffff:172.16.0.1", "::ffff:192.168.0.1"] {
+            let ip: IpAddr = addr.parse().unwrap();
+            assert!(is_private_or_internal(ip), "{addr} should be private");
+        }
+    }
+
+    #[test]
+    fn test_is_private_blocks_ipv4_mapped_imds() {
+        // ::ffff:169.254.169.254 — IPv4-mapped IMDS
+        let ip: IpAddr = "::ffff:169.254.169.254".parse().unwrap();
         assert!(is_private_or_internal(ip));
     }
 
