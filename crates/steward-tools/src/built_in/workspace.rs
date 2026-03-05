@@ -93,30 +93,36 @@ pub fn open_safely(path: &Path, _workspace: &Path) -> std::io::Result<std::fs::F
 
 /// Write `content` to `path` with comprehensive TOCTOU protection.
 ///
-/// Like [`open_safely`] but for writes: opens with `O_NOFOLLOW | O_CREAT |
-/// O_TRUNC`, then verifies the resulting file descriptor's real path is still
-/// inside `workspace`.  If the check fails the newly created/truncated file
-/// is removed before the error is returned, preventing partial writes to
-/// out-of-workspace locations.
+/// Like [`open_safely`] but for writes: opens with `O_NOFOLLOW | O_CREAT`
+/// **without** `O_TRUNC` so that if the subsequent workspace verification
+/// fails we have not modified any existing file content.  Only after
+/// [`verify_fd_within_workspace`] passes do we truncate via
+/// [`std::fs::File::set_len`] and write.
+///
+/// If verification fails the file descriptor is simply closed (dropped) —
+/// the file on disk is left untouched.  We do **not** attempt to delete it
+/// because the path might refer to an external file we have no business
+/// removing.
 #[cfg(unix)]
 pub fn write_safely(path: &Path, workspace: &Path, content: &[u8]) -> std::io::Result<()> {
+    use std::io::Seek as _;
     use std::io::Write as _;
     use std::os::unix::fs::OpenOptionsExt as _;
     use std::os::unix::io::AsRawFd as _;
 
+    // Open WITHOUT truncate — if verification fails, existing content is intact.
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
-        .truncate(true)
         .custom_flags(libc::O_NOFOLLOW)
         .open(path)?;
 
-    if let Err(e) = verify_fd_within_workspace(file.as_raw_fd(), workspace) {
-        drop(file);
-        let _ = std::fs::remove_file(path);
-        return Err(e);
-    }
+    // Verify AFTER open; on failure just drop the fd without touching the file.
+    verify_fd_within_workspace(file.as_raw_fd(), workspace)?;
 
+    // Path is confirmed safe — now truncate and write.
+    file.set_len(0)?;
+    file.seek(std::io::SeekFrom::Start(0))?;
     file.write_all(content)
 }
 

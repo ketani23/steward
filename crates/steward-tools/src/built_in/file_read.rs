@@ -172,7 +172,10 @@ impl BuiltInHandler for FileReadTool {
         } else {
             false
         };
-        let total_lines = skip + lines_returned;
+        // Use the actual number of lines skipped (not the requested offset) so
+        // that total_lines reflects the real file length when offset > EOF.
+        // e.g. offset=1000 on a 10-line file: skipped=10, collected=0 → total=10.
+        let total_lines = skipped + lines_returned;
         let content = collected.join("\n");
 
         // 5. Return structured result.

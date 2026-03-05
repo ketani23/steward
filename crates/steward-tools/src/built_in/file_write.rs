@@ -96,7 +96,9 @@ impl BuiltInHandler for FileWriteTool {
 
         debug!(path = %safe_path.display(), "file.write executing");
 
-        // 3. Create parent directories.
+        // 3. Create parent directories, then re-canonicalize and re-verify
+        //    the parent to guard against a symlink race between
+        //    validate_write_path and create_dir_all.
         if let Some(parent) = safe_path.parent() {
             tokio::fs::create_dir_all(parent).await.map_err(|e| {
                 StewardError::Tool(format!(
@@ -104,6 +106,19 @@ impl BuiltInHandler for FileWriteTool {
                     params.path
                 ))
             })?;
+
+            let canonical_parent = tokio::fs::canonicalize(parent).await.map_err(|e| {
+                StewardError::Tool(format!("cannot canonicalize parent directory: {e}"))
+            })?;
+            let canonical_ws = tokio::fs::canonicalize(&self.workspace)
+                .await
+                .map_err(|e| StewardError::Tool(format!("cannot canonicalize workspace: {e}")))?;
+            if !canonical_parent.starts_with(&canonical_ws) {
+                return Err(StewardError::Tool(format!(
+                    "parent directory is outside workspace: {}",
+                    params.path
+                )));
+            }
         }
 
         // 4. Write content with O_NOFOLLOW + post-open /proc/self/fd verification
