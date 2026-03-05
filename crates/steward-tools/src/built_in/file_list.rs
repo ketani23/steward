@@ -194,6 +194,28 @@ impl BuiltInHandler for FileListTool {
     }
 }
 
+/// Sanitize a filesystem name for safe display.
+///
+/// Replaces characters that could forge output lines or inject control codes:
+/// - `\n` and `\r` → literal `\n` / `\r` escape sequences
+/// - `\t` → literal `\t`
+/// - Other C0/C1 control characters and DEL (\x7f) → Unicode replacement char (U+FFFD)
+///
+/// Printable characters (including non-ASCII Unicode) are passed through unchanged.
+fn sanitize_display(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 || c == '\x7f' => out.push('\u{FFFD}'),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// Recursively collect directory entries into `out`.
 ///
 /// `root` is the top-level directory being listed (for computing relative
@@ -224,12 +246,16 @@ fn collect_entries(
         // Display path relative to root.  If strip_prefix fails (should not
         // happen since entry_path is always under root, but guard anyway) fall
         // back to just the filename to avoid leaking the absolute path.
-        let rel = match entry_path.strip_prefix(root) {
-            Ok(r) => r.to_string_lossy().into_owned(),
-            Err(_) => entry_path
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default(),
+        // Sanitize control characters so filenames cannot forge output lines.
+        let rel = {
+            let raw = match entry_path.strip_prefix(root) {
+                Ok(r) => r.to_string_lossy().into_owned(),
+                Err(_) => entry_path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+            };
+            sanitize_display(&raw)
         };
 
         if symlink_meta.file_type().is_symlink() {
@@ -578,6 +604,67 @@ mod tests {
             "entry_count {count} must not exceed MAX_ENTRIES {MAX_ENTRIES}"
         );
         assert_eq!(count, 50, "all 50 files must be listed");
+    }
+
+    // ── filename sanitization ─────────────────────────────────────────────
+
+    /// Filenames containing newlines must not forge extra output lines.
+    #[test]
+    fn test_sanitize_display_escapes_newline() {
+        let result = sanitize_display("evil\ninjected line");
+        assert_eq!(result, "evil\\ninjected line");
+        assert!(
+            !result.contains('\n'),
+            "newline must not appear in sanitized output"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_display_escapes_cr_and_tab() {
+        assert_eq!(sanitize_display("a\rb"), "a\\rb");
+        assert_eq!(sanitize_display("a\tb"), "a\\tb");
+    }
+
+    #[test]
+    fn test_sanitize_display_replaces_other_control_chars() {
+        // \x01 and \x7f are control chars → replaced with U+FFFD
+        let result = sanitize_display("a\x01b\x7fc");
+        assert_eq!(result, "a\u{FFFD}b\u{FFFD}c");
+    }
+
+    #[test]
+    fn test_sanitize_display_passes_printable_unicode() {
+        let s = "src/Ünïcödé/file.rs";
+        assert_eq!(sanitize_display(s), s);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_listing_escapes_newline_in_filename() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Create a file whose name contains a newline.
+        let bad_name = tmp.path().join("evil\ninjected");
+        fs::write(&bad_name, "x").unwrap();
+
+        let result = tool(tmp.path())
+            .execute(serde_json::json!({}))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        let listing = result.output["listing"].as_str().unwrap();
+        // The newline must be escaped in the output, not rendered as a real newline
+        // that could forge an extra line.
+        assert!(
+            listing.contains("\\n"),
+            "newline in filename must be escaped in listing: {listing}"
+        );
+        assert_eq!(
+            listing.lines().filter(|l| l.contains("injected")).count(),
+            1,
+            "injected text must appear only once, not as a separate forged line: {listing}"
+        );
     }
 
     // ── format_listing ───────────────────────────────────────────────────

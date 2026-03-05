@@ -88,18 +88,26 @@ impl BuiltInHandler for FileEditTool {
     ///
     /// Flow:
     /// 1. Parse `{"path": "...", "old_text": "...", "new_text": "..."}` from JSON.
-    /// 2. Validate path against workspace root.
-    /// 3. Read file contents.
-    /// 4. Count occurrences of `old_text`.
-    /// 5. Reject if zero (not found) or more than one (ambiguous).
-    /// 6. Replace and write the modified file back.
-    /// 7. Return confirmation.
+    /// 2. Reject empty `old_text` (undefined replacement semantics).
+    /// 3. Validate path against workspace root.
+    /// 4. Read file contents.
+    /// 5. Count occurrences of `old_text`.
+    /// 6. Reject if zero (not found) or more than one (ambiguous).
+    /// 7. Replace and write the modified file back.
+    /// 8. Return confirmation.
     async fn execute(&self, parameters: serde_json::Value) -> Result<ToolResult, StewardError> {
         // 1. Parse parameters.
         let params: FileEditParams = serde_json::from_value(parameters)
             .map_err(|e| StewardError::Tool(format!("invalid file.edit parameters: {e}")))?;
 
-        // 2. Validate path (file must exist to edit it).
+        // 2. Reject empty old_text before touching the filesystem — an empty
+        //    string matches every position and makes replacement semantics
+        //    undefined.
+        if params.old_text.is_empty() {
+            return Err(StewardError::Tool("old_text must not be empty".to_string()));
+        }
+
+        // Validate path (file must exist to edit it).
         let safe_path = validate_path(&params.path, &self.workspace)?;
 
         debug!(path = %safe_path.display(), "file.edit executing");
@@ -258,6 +266,29 @@ mod tests {
         assert!(content.contains("REPLACED"));
         assert!(content.contains("line3"));
         assert!(!content.contains("target"));
+    }
+
+    // ── error: empty old_text ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_empty_old_text_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("file.txt");
+        fs::write(&file, "some content").unwrap();
+
+        let err = tool(tmp.path())
+            .execute(serde_json::json!({
+                "path": "file.txt",
+                "old_text": "",
+                "new_text": "replacement"
+            }))
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("old_text must not be empty"),
+            "unexpected error: {err}"
+        );
     }
 
     // ── error: not found ─────────────────────────────────────────────────

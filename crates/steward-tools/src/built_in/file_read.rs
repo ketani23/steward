@@ -172,10 +172,11 @@ impl BuiltInHandler for FileReadTool {
         } else {
             false
         };
-        // Use the actual number of lines skipped (not the requested offset) so
-        // that total_lines reflects the real file length when offset > EOF.
-        // e.g. offset=1000 on a 10-line file: skipped=10, collected=0 → total=10.
-        let total_lines = skipped + lines_returned;
+        // lines_shown = lines processed up to the end of the returned window
+        // (skipped lines + lines actually returned).  When the file is
+        // truncated this is NOT the full file line count — callers should use
+        // `truncated` to detect that more content exists.
+        let lines_shown = skipped + lines_returned;
         let content = collected.join("\n");
 
         // 5. Return structured result.
@@ -184,7 +185,7 @@ impl BuiltInHandler for FileReadTool {
             output: serde_json::json!({
                 "content": content,
                 "path": params.path,
-                "total_lines": total_lines,
+                "lines_shown": lines_shown,
                 "lines_returned": lines_returned,
                 "offset": skip + 1,
                 "truncated": truncated,
@@ -309,7 +310,7 @@ mod tests {
 
         assert!(result.success);
         assert_eq!(result.output["truncated"], false);
-        assert_eq!(result.output["total_lines"], 2);
+        assert_eq!(result.output["lines_shown"], 2);
     }
 
     // ── security ─────────────────────────────────────────────────────────
