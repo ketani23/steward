@@ -290,7 +290,7 @@ mod tests {
 
     #[test]
     fn test_format_results_numbered_correctly() {
-        let results = vec![
+        let results = [
             BraveSearchResult {
                 title: "First Result".to_string(),
                 url: "https://first.com".to_string(),
