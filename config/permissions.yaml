@@ -20,6 +20,7 @@ tiers:
       - note.create
       - message.draft
       - file.read
+      - file.list
       - web.search
       - web.fetch
       # Safe, read-only shell commands that do not modify system state.
@@ -41,6 +42,7 @@ tiers:
       - message.send
       - file.modify
       - file.write
+      - file.edit
       - calendar.create
       - calendar.modify
       - purchase.any

@@ -2449,6 +2449,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "steward-types",
+ "tempfile",
  "tokio",
  "tracing",
  "uuid",
