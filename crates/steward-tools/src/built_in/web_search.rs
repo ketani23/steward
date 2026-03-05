@@ -72,7 +72,7 @@ impl WebSearchTool {
                         "description": "The search query"
                     },
                     "count": {
-                        "type": "number",
+                        "type": "integer",
                         "description": "Number of results to return (default 5, max 10)"
                     }
                 },

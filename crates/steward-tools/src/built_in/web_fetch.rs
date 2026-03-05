@@ -49,38 +49,61 @@ const TIMEOUT_SECS: u64 = 30;
 /// Maximum number of redirects to follow per fetch.
 const MAX_REDIRECTS: u8 = 5;
 
-/// Returns `true` if `ip` falls in a private, loopback, or link-local range.
+/// Returns `true` if `ip` is NOT a globally routable address and should be blocked.
+///
+/// Only IPs that are clearly public and globally routable are permitted. Every
+/// special-purpose or non-global range is blocked, including all of the following.
 ///
 /// Blocked IPv4 ranges:
-/// - 127.0.0.0/8    — loopback
-/// - 10.0.0.0/8     — RFC-1918 private
-/// - 172.16.0.0/12  — RFC-1918 private
-/// - 192.168.0.0/16 — RFC-1918 private
-/// - 169.254.0.0/16 — link-local / cloud IMDS
+/// - 0.0.0.0/8          — unspecified
+/// - 10.0.0.0/8         — RFC-1918 private
+/// - 100.64.0.0/10      — shared address space / carrier-grade NAT (RFC 6598)
+/// - 127.0.0.0/8        — loopback
+/// - 169.254.0.0/16     — link-local / cloud IMDS (AWS, GCP, Azure)
+/// - 172.16.0.0/12      — RFC-1918 private
+/// - 192.0.0.0/24       — IETF protocol assignments (RFC 6890)
+/// - 192.0.2.0/24       — TEST-NET-1 / documentation (RFC 5737)
+/// - 192.88.99.0/24     — 6to4 relay anycast, deprecated (RFC 7526)
+/// - 192.168.0.0/16     — RFC-1918 private
+/// - 198.18.0.0/15      — network benchmarking (RFC 2544)
+/// - 198.51.100.0/24    — TEST-NET-2 / documentation (RFC 5737)
+/// - 203.0.113.0/24     — TEST-NET-3 / documentation (RFC 5737)
+/// - 224.0.0.0/4        — multicast
+/// - 255.255.255.255/32 — broadcast
 ///
 /// Blocked IPv6 ranges:
-/// - ::1             — loopback
-/// - fc00::/7        — ULA (unique local)
-/// - fe80::/10       — link-local
-/// - ::ffff:0:0/96   — IPv4-mapped (checked recursively against IPv4 ranges above)
-fn is_private_or_internal(ip: IpAddr) -> bool {
+/// - ::                 — unspecified
+/// - ::1               — loopback
+/// - fc00::/7          — ULA (unique local, RFC 4193)
+/// - fe80::/10         — link-local
+/// - ff00::/8          — multicast
+/// - ::ffff:0:0/96     — IPv4-mapped (recursively checked against IPv4 rules above)
+fn is_not_globally_routable(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
             let o = v4.octets();
             v4.is_loopback()
-                || v4.is_unspecified()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_broadcast()
+                || v4.is_documentation()
                 || v4.is_multicast()
-                || o[0] == 10
-                || (o[0] == 172 && (16..=31).contains(&o[1]))
-                || (o[0] == 192 && o[1] == 168)
-                || (o[0] == 169 && o[1] == 254)
+                || v4.is_unspecified()
+                // 100.64.0.0/10 — shared address space / carrier-grade NAT (RFC 6598)
+                || (o[0] == 100 && (64..=127).contains(&o[1]))
+                // 192.0.0.0/24 — IETF protocol assignments (RFC 6890)
+                || (o[0] == 192 && o[1] == 0 && o[2] == 0)
+                // 192.88.99.0/24 — 6to4 relay anycast, deprecated (RFC 7526)
+                || (o[0] == 192 && o[1] == 88 && o[2] == 99)
+                // 198.18.0.0/15 — network benchmarking (RFC 2544)
+                || (o[0] == 198 && (18..=19).contains(&o[1]))
         }
         IpAddr::V6(v6) => {
             // IPv4-mapped addresses (::ffff:0:0/96): unwrap the inner IPv4 and
-            // recheck it against all IPv4 private ranges.  This prevents bypasses
+            // recheck it against all IPv4 rules above. This prevents bypasses
             // via e.g. ::ffff:127.0.0.1 or ::ffff:169.254.169.254.
             if let Some(v4) = v6.to_ipv4_mapped() {
-                return is_private_or_internal(IpAddr::V4(v4));
+                return is_not_globally_routable(IpAddr::V4(v4));
             }
             v6.is_loopback()
                 || v6.is_unspecified()
@@ -119,7 +142,7 @@ impl WebFetchTool {
                         "description": "The URL to fetch"
                     },
                     "max_chars": {
-                        "type": "number",
+                        "type": "integer",
                         "description": "Maximum characters to return (default 8000)"
                     }
                 },
@@ -179,10 +202,10 @@ impl WebFetchTool {
         let mut safe_addr: Option<SocketAddr> = None;
         for addr in &addrs {
             let ip = addr.ip();
-            if is_private_or_internal(ip) {
-                warn!(url = %url, ip = %ip, "blocked SSRF attempt to private/internal IP");
+            if is_not_globally_routable(ip) {
+                warn!(url = %url, ip = %ip, "blocked SSRF attempt to non-global IP");
                 return Err(StewardError::Tool(format!(
-                    "URL is blocked: resolves to a private or internal IP address ({ip})"
+                    "URL is blocked: resolves to a non-globally-routable IP address ({ip})"
                 )));
             }
             if safe_addr.is_none() {
@@ -603,7 +626,7 @@ mod tests {
     #[test]
     fn test_is_private_blocks_loopback_ipv4() {
         let ip: IpAddr = "127.0.0.1".parse().unwrap();
-        assert!(is_private_or_internal(ip));
+        assert!(is_not_globally_routable(ip));
     }
 
     #[test]
@@ -617,43 +640,43 @@ mod tests {
             "192.168.255.255",
         ] {
             let ip: IpAddr = addr.parse().unwrap();
-            assert!(is_private_or_internal(ip), "{addr} should be private");
+            assert!(is_not_globally_routable(ip), "{addr} should be private");
         }
     }
 
     #[test]
     fn test_is_private_blocks_link_local() {
         let ip: IpAddr = "169.254.169.254".parse().unwrap();
-        assert!(is_private_or_internal(ip));
+        assert!(is_not_globally_routable(ip));
     }
 
     #[test]
     fn test_is_private_blocks_ipv6_loopback() {
         let ip: IpAddr = "::1".parse().unwrap();
-        assert!(is_private_or_internal(ip));
+        assert!(is_not_globally_routable(ip));
     }
 
     #[test]
     fn test_is_private_blocks_ipv6_ula() {
         // fc00::/7 covers fc00:: through fdff::
         let ip: IpAddr = "fd12:3456:789a:1::1".parse().unwrap();
-        assert!(is_private_or_internal(ip));
+        assert!(is_not_globally_routable(ip));
     }
 
     #[test]
     fn test_is_private_blocks_ipv6_link_local() {
         // fe80::/10 link-local range
         let ip: IpAddr = "fe80::1".parse().unwrap();
-        assert!(is_private_or_internal(ip));
+        assert!(is_not_globally_routable(ip));
         let ip: IpAddr = "febf::ffff".parse().unwrap();
-        assert!(is_private_or_internal(ip));
+        assert!(is_not_globally_routable(ip));
     }
 
     #[test]
     fn test_is_private_blocks_ipv4_mapped_loopback() {
         // ::ffff:127.0.0.1 — IPv4-mapped loopback
         let ip: IpAddr = "::ffff:127.0.0.1".parse().unwrap();
-        assert!(is_private_or_internal(ip));
+        assert!(is_not_globally_routable(ip));
     }
 
     #[test]
@@ -661,7 +684,7 @@ mod tests {
         // ::ffff:10.0.0.1, ::ffff:172.16.0.1, ::ffff:192.168.0.1
         for addr in &["::ffff:10.0.0.1", "::ffff:172.16.0.1", "::ffff:192.168.0.1"] {
             let ip: IpAddr = addr.parse().unwrap();
-            assert!(is_private_or_internal(ip), "{addr} should be private");
+            assert!(is_not_globally_routable(ip), "{addr} should be private");
         }
     }
 
@@ -669,14 +692,54 @@ mod tests {
     fn test_is_private_blocks_ipv4_mapped_imds() {
         // ::ffff:169.254.169.254 — IPv4-mapped IMDS
         let ip: IpAddr = "::ffff:169.254.169.254".parse().unwrap();
-        assert!(is_private_or_internal(ip));
+        assert!(is_not_globally_routable(ip));
+    }
+
+    #[test]
+    fn test_is_not_global_blocks_carrier_grade_nat() {
+        // 100.64.0.0/10 — shared address space / carrier-grade NAT (RFC 6598)
+        let ip: IpAddr = "100.64.0.0".parse().unwrap();
+        assert!(
+            is_not_globally_routable(ip),
+            "100.64.0.0 (CGNAT) should be blocked"
+        );
+        let ip: IpAddr = "100.127.255.255".parse().unwrap();
+        assert!(
+            is_not_globally_routable(ip),
+            "100.127.255.255 (CGNAT) should be blocked"
+        );
+    }
+
+    #[test]
+    fn test_is_not_global_blocks_benchmarking() {
+        // 198.18.0.0/15 — network benchmarking (RFC 2544)
+        let ip: IpAddr = "198.18.0.1".parse().unwrap();
+        assert!(
+            is_not_globally_routable(ip),
+            "198.18.0.1 (benchmarking) should be blocked"
+        );
+        let ip: IpAddr = "198.19.255.255".parse().unwrap();
+        assert!(
+            is_not_globally_routable(ip),
+            "198.19.255.255 (benchmarking) should be blocked"
+        );
+    }
+
+    #[test]
+    fn test_is_not_global_blocks_ietf_protocol_assignments() {
+        // 192.0.0.0/24 — IETF protocol assignments (RFC 6890)
+        let ip: IpAddr = "192.0.0.1".parse().unwrap();
+        assert!(
+            is_not_globally_routable(ip),
+            "192.0.0.1 (IETF assignments) should be blocked"
+        );
     }
 
     #[test]
     fn test_is_private_allows_public_ips() {
         for addr in &["1.1.1.1", "8.8.8.8", "208.67.222.222"] {
             let ip: IpAddr = addr.parse().unwrap();
-            assert!(!is_private_or_internal(ip), "{addr} should be public");
+            assert!(!is_not_globally_routable(ip), "{addr} should be public");
         }
     }
 
