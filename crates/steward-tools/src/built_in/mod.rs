@@ -3,3 +3,5 @@
 /// These tools run directly in the agent process without sandboxing.
 /// They are audited and trusted by design.
 pub mod shell;
+pub mod web_fetch;
+pub mod web_search;
