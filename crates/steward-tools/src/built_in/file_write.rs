@@ -17,7 +17,7 @@ use tracing::debug;
 use steward_types::actions::{PermissionTier, ToolDefinition, ToolResult, ToolSource};
 use steward_types::errors::StewardError;
 
-use crate::built_in::workspace::{validate_write_path, workspace_root, write_file_no_follow};
+use crate::built_in::workspace::{validate_write_path, workspace_root, write_safely};
 use crate::registry::BuiltInHandler;
 
 /// File write tool — creates or overwrites files within the workspace.
@@ -106,17 +106,16 @@ impl BuiltInHandler for FileWriteTool {
             })?;
         }
 
-        // 4. Write content with O_NOFOLLOW to close the TOCTOU window between
-        //    validate_write_path and the actual open syscall.  If a symlink is
-        //    swapped in at safe_path between validation and write, the kernel
-        //    returns ELOOP immediately rather than following the link.
+        // 4. Write content with O_NOFOLLOW + post-open /proc/self/fd verification
+        //    to eliminate both final-component and ancestor-directory TOCTOU races.
         let bytes = params.content.len();
         {
             let path = safe_path;
             let display = params.path.clone();
             let content = params.content.into_bytes();
+            let workspace = self.workspace.clone();
             tokio::task::spawn_blocking(move || {
-                write_file_no_follow(&path, &content)
+                write_safely(&path, &workspace, &content)
                     .map_err(|e| StewardError::Tool(format!("cannot write {display}: {e}")))
             })
             .await

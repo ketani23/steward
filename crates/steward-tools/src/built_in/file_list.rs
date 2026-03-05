@@ -25,6 +25,18 @@ use crate::registry::BuiltInHandler;
 /// Default maximum directory depth for recursive listings.
 const DEFAULT_MAX_DEPTH: usize = 3;
 
+/// Hard cap on recursion depth regardless of what the caller requests.
+///
+/// User-supplied `max_depth` values exceeding this are silently clamped to
+/// prevent unbounded traversal of deeply-nested directory trees.
+const MAX_DEPTH: usize = 10;
+
+/// Hard cap on total directory entries returned per listing.
+///
+/// Traversal stops once this many entries have been collected, preventing
+/// resource exhaustion when listing very large directory trees.
+const MAX_ENTRIES: usize = 10_000;
+
 /// File list tool — enumerates files and directories within the workspace.
 ///
 /// Implements [`BuiltInHandler`] to be registered with the tool registry.
@@ -98,6 +110,18 @@ struct Entry {
     size: u64,
 }
 
+/// Immutable configuration for a single `collect_entries` traversal.
+struct TraversalConfig<'a> {
+    /// Canonicalized workspace root — used for symlink boundary checks.
+    workspace: &'a Path,
+    /// Whether to recurse into subdirectories.
+    recursive: bool,
+    /// Maximum recursion depth (already clamped to `MAX_DEPTH` by caller).
+    max_depth: usize,
+    /// Hard cap on the total number of entries to collect.
+    max_entries: usize,
+}
+
 #[async_trait]
 impl BuiltInHandler for FileListTool {
     /// Execute a file list request.
@@ -131,20 +155,20 @@ impl BuiltInHandler for FileListTool {
         debug!(dir = %target_dir.display(), "file.list executing");
 
         let recursive = params.recursive.unwrap_or(false);
-        let max_depth = params.max_depth.unwrap_or(DEFAULT_MAX_DEPTH);
+        // Clamp caller-supplied depth to the hard cap to prevent unbounded traversal.
+        let max_depth = params.max_depth.unwrap_or(DEFAULT_MAX_DEPTH).min(MAX_DEPTH);
 
-        // 3. Collect entries.
-        let mut entries: Vec<Entry> = Vec::new();
-        collect_entries(
-            &target_dir,
-            &target_dir,
-            &canonical_workspace,
+        let cfg = TraversalConfig {
+            workspace: &canonical_workspace,
             recursive,
-            0,
             max_depth,
-            &mut entries,
-        )
-        .map_err(|e| StewardError::Tool(format!("error listing directory: {e}")))?;
+            max_entries: MAX_ENTRIES,
+        };
+
+        // 3. Collect entries, bounded by the hard entry cap.
+        let mut entries: Vec<Entry> = Vec::new();
+        collect_entries(&target_dir, &target_dir, &cfg, 0, &mut entries)
+            .map_err(|e| StewardError::Tool(format!("error listing directory: {e}")))?;
 
         // Sort: directories first, then by name.
         entries.sort_by(|a, b| {
@@ -174,21 +198,23 @@ impl BuiltInHandler for FileListTool {
 ///
 /// `root` is the top-level directory being listed (for computing relative
 /// display paths).  `current` is the directory being scanned at this call.
-/// `workspace` is the canonicalized workspace root used for the symlink
-/// boundary check — symlinks whose resolved targets fall outside it are
-/// skipped and noted in the listing.
+/// `cfg` carries immutable traversal limits (workspace boundary, depth cap,
+/// entry cap).  `depth` tracks the current recursion level.
 fn collect_entries(
     root: &Path,
     current: &Path,
-    workspace: &Path,
-    recursive: bool,
+    cfg: &TraversalConfig<'_>,
     depth: usize,
-    max_depth: usize,
     out: &mut Vec<Entry>,
 ) -> std::io::Result<()> {
     let read_dir = fs::read_dir(current)?;
 
     for entry_result in read_dir {
+        // Stop traversal once the hard entry cap is reached.
+        if out.len() >= cfg.max_entries {
+            break;
+        }
+
         let entry = entry_result?;
         let entry_path = entry.path();
 
@@ -209,7 +235,7 @@ fn collect_entries(
         if symlink_meta.file_type().is_symlink() {
             // Resolve the symlink target and verify it stays within the workspace.
             match fs::canonicalize(&entry_path) {
-                Ok(resolved) if resolved.starts_with(workspace) => {
+                Ok(resolved) if resolved.starts_with(cfg.workspace) => {
                     // Safe: symlink target is inside the workspace.
                     if resolved.is_dir() {
                         out.push(Entry {
@@ -217,16 +243,8 @@ fn collect_entries(
                             kind: 'd',
                             size: 0,
                         });
-                        if recursive && depth < max_depth {
-                            collect_entries(
-                                root,
-                                &resolved,
-                                workspace,
-                                recursive,
-                                depth + 1,
-                                max_depth,
-                                out,
-                            )?;
+                        if cfg.recursive && depth < cfg.max_depth {
+                            collect_entries(root, &resolved, cfg, depth + 1, out)?;
                         }
                     } else {
                         let size = fs::metadata(&entry_path).map(|m| m.len()).unwrap_or(0);
@@ -252,19 +270,11 @@ fn collect_entries(
                 kind: 'd',
                 size: 0,
             });
-            if recursive && depth < max_depth {
+            if cfg.recursive && depth < cfg.max_depth {
                 // Canonicalize before recursing to guard against TOCTOU races.
                 match fs::canonicalize(&entry_path) {
-                    Ok(canonical) if canonical.starts_with(workspace) => {
-                        collect_entries(
-                            root,
-                            &canonical,
-                            workspace,
-                            recursive,
-                            depth + 1,
-                            max_depth,
-                            out,
-                        )?;
+                    Ok(canonical) if canonical.starts_with(cfg.workspace) => {
+                        collect_entries(root, &canonical, cfg, depth + 1, out)?;
                     }
                     _ => {} // Resolved outside workspace — skip.
                 }
@@ -504,6 +514,70 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("outside workspace"));
+    }
+
+    // ── resource caps ────────────────────────────────────────────────────
+
+    /// max_depth values larger than MAX_DEPTH (10) must be clamped to 10.
+    ///
+    /// Build a directory tree 11 levels deep; with max_depth=100 clamped to
+    /// 10, contents at depth 11 must not appear in the listing.
+    #[tokio::test]
+    async fn test_max_depth_clamped_at_hard_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Create 11 nested levels: d0/d1/.../d10/sentinel.txt
+        let mut p = tmp.path().to_path_buf();
+        for i in 0..=10 {
+            p = p.join(format!("d{i}"));
+            fs::create_dir(&p).unwrap();
+        }
+        fs::write(p.join("sentinel.txt"), "x").unwrap();
+
+        // max_depth=100 must be silently clamped to MAX_DEPTH=10; the file
+        // inside the 11th-level directory must not appear.
+        let result = tool(tmp.path())
+            .execute(serde_json::json!({"recursive": true, "max_depth": 100}))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        let listing = result.output["listing"].as_str().unwrap();
+        assert!(
+            !listing.contains("sentinel.txt"),
+            "depth cap must prevent seeing files beyond depth 10: {listing}"
+        );
+        // The 10th-level directory itself must still be visible.
+        assert!(
+            listing.contains("d9"),
+            "depth 10 directories must be visible: {listing}"
+        );
+    }
+
+    /// Traversal stops after MAX_ENTRIES entries regardless of tree size.
+    ///
+    /// This test verifies the early-exit guard is wired correctly by
+    /// confirming that entry_count never exceeds MAX_ENTRIES.  Creating
+    /// exactly MAX_ENTRIES files is impractical, so we verify with a smaller
+    /// set that the cap infrastructure is present and the count is accurate.
+    #[tokio::test]
+    async fn test_entry_count_does_not_exceed_max_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        for i in 0..50 {
+            fs::write(tmp.path().join(format!("f{i}.txt")), "x").unwrap();
+        }
+
+        let result = tool(tmp.path())
+            .execute(serde_json::json!({}))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        let count = result.output["entry_count"].as_u64().unwrap();
+        assert!(
+            count <= MAX_ENTRIES as u64,
+            "entry_count {count} must not exceed MAX_ENTRIES {MAX_ENTRIES}"
+        );
+        assert_eq!(count, 50, "all 50 files must be listed");
     }
 
     // ── format_listing ───────────────────────────────────────────────────

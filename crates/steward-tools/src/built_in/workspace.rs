@@ -62,47 +62,103 @@ pub fn validate_write_path(requested: &str, workspace: &Path) -> Result<PathBuf,
     Ok(final_path)
 }
 
-/// Open a file for reading with `O_NOFOLLOW` to prevent TOCTOU symlink attacks.
+/// Open a file for reading with comprehensive TOCTOU protection.
 ///
-/// If a symlink is swapped in at `path` between the path-validation check and
-/// the actual open call, `O_NOFOLLOW` causes the kernel to return `ELOOP`
-/// immediately rather than following the link.
+/// Two layers of protection:
+/// 1. `O_NOFOLLOW` — the kernel refuses to follow a symlink at the final path
+///    component, catching last-component symlink swaps.
+/// 2. Post-open `/proc/self/fd/{fd}` verification (Linux) — reads the real
+///    path of the file descriptor and confirms it is inside `workspace`,
+///    catching ancestor-directory symlink swaps that occur between
+///    path validation and the actual `open(2)` syscall.
 #[cfg(unix)]
-pub fn open_file_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
+pub fn open_safely(path: &Path, workspace: &Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt as _;
-    std::fs::OpenOptions::new()
+    use std::os::unix::io::AsRawFd as _;
+
+    let file = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
+        .open(path)?;
+
+    verify_fd_within_workspace(file.as_raw_fd(), workspace)?;
+    Ok(file)
 }
 
 /// Fallback for non-Unix platforms where `O_NOFOLLOW` is unavailable.
 #[cfg(not(unix))]
-pub fn open_file_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
+pub fn open_safely(path: &Path, _workspace: &Path) -> std::io::Result<std::fs::File> {
     std::fs::File::open(path)
 }
 
-/// Write `content` to `path` with `O_NOFOLLOW | O_CREAT | O_TRUNC` to prevent
-/// TOCTOU symlink attacks.
+/// Write `content` to `path` with comprehensive TOCTOU protection.
 ///
-/// Returns `ELOOP` if the final path component is a symbolic link.
+/// Like [`open_safely`] but for writes: opens with `O_NOFOLLOW | O_CREAT |
+/// O_TRUNC`, then verifies the resulting file descriptor's real path is still
+/// inside `workspace`.  If the check fails the newly created/truncated file
+/// is removed before the error is returned, preventing partial writes to
+/// out-of-workspace locations.
 #[cfg(unix)]
-pub fn write_file_no_follow(path: &Path, content: &[u8]) -> std::io::Result<()> {
+pub fn write_safely(path: &Path, workspace: &Path, content: &[u8]) -> std::io::Result<()> {
     use std::io::Write as _;
     use std::os::unix::fs::OpenOptionsExt as _;
+    use std::os::unix::io::AsRawFd as _;
+
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
         .custom_flags(libc::O_NOFOLLOW)
         .open(path)?;
+
+    if let Err(e) = verify_fd_within_workspace(file.as_raw_fd(), workspace) {
+        drop(file);
+        let _ = std::fs::remove_file(path);
+        return Err(e);
+    }
+
     file.write_all(content)
 }
 
 /// Fallback for non-Unix platforms.
 #[cfg(not(unix))]
-pub fn write_file_no_follow(path: &Path, content: &[u8]) -> std::io::Result<()> {
+pub fn write_safely(path: &Path, _workspace: &Path, content: &[u8]) -> std::io::Result<()> {
     std::fs::write(path, content)
+}
+
+/// Verify that the file descriptor's real path is within the workspace.
+///
+/// On Linux, `/proc/self/fd/{fd}` is a symlink to the actual path of the open
+/// file as seen by the kernel.  Reading it after `open(2)` and comparing with
+/// the canonical workspace root eliminates the TOCTOU window: even if an
+/// ancestor directory was replaced by a symlink between our pre-open
+/// `validate_path` check and the actual open syscall, the fd will point to
+/// the true location which we can then verify.
+///
+/// On non-Linux systems this is a no-op; `O_NOFOLLOW` (applied by the
+/// callers) remains the best available protection.
+#[cfg(unix)]
+fn verify_fd_within_workspace(
+    fd: std::os::unix::io::RawFd,
+    workspace: &Path,
+) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let canonical_workspace = std::fs::canonicalize(workspace)?;
+        let real_path = std::fs::read_link(format!("/proc/self/fd/{fd}"))?;
+        if !real_path.starts_with(&canonical_workspace) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("opened path is outside workspace: {}", real_path.display()),
+            ));
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // Suppress unused variable warnings on non-Linux Unix.
+        let _ = (fd, workspace);
+    }
+    Ok(())
 }
 
 // ──────────────────────────── internal helpers ────────────────────────────
@@ -372,16 +428,16 @@ mod tests {
         );
     }
 
-    // ── open_file_no_follow / write_file_no_follow ────────────────────────
+    // ── open_safely / write_safely ────────────────────────────────────────
 
     #[cfg(unix)]
     #[test]
-    fn test_open_file_no_follow_accepts_regular_file() {
+    fn test_open_safely_accepts_regular_file() {
         let (_tmp, ws) = make_workspace();
         let file = ws.join("regular.txt");
         fs::write(&file, "data").unwrap();
 
-        let result = open_file_no_follow(&file);
+        let result = open_safely(&file, &ws);
         assert!(
             result.is_ok(),
             "regular file must be openable: {:?}",
@@ -391,7 +447,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn test_open_file_no_follow_rejects_symlink() {
+    fn test_open_safely_rejects_symlink() {
         let (_tmp, ws) = make_workspace();
         let target = ws.join("real.txt");
         fs::write(&target, "data").unwrap();
@@ -400,7 +456,7 @@ mod tests {
         std::os::unix::fs::symlink(&target, &link).unwrap();
 
         // O_NOFOLLOW must refuse to open the symlink (final component is a symlink).
-        let result = open_file_no_follow(&link);
+        let result = open_safely(&link, &ws);
         assert!(
             result.is_err(),
             "O_NOFOLLOW should reject opening a symlink directly"
@@ -409,11 +465,11 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn test_write_file_no_follow_accepts_regular_path() {
+    fn test_write_safely_accepts_regular_path() {
         let (_tmp, ws) = make_workspace();
         let file = ws.join("out.txt");
 
-        let result = write_file_no_follow(&file, b"hello");
+        let result = write_safely(&file, &ws, b"hello");
         assert!(
             result.is_ok(),
             "writing to a regular path must succeed: {:?}",
@@ -424,7 +480,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn test_write_file_no_follow_rejects_symlink() {
+    fn test_write_safely_rejects_symlink() {
         let (_tmp, ws) = make_workspace();
         let target = ws.join("real.txt");
         fs::write(&target, "original").unwrap();
@@ -433,13 +489,38 @@ mod tests {
         std::os::unix::fs::symlink(&target, &link).unwrap();
 
         // O_NOFOLLOW must refuse to write through a symlink final component.
-        let result = write_file_no_follow(&link, b"evil");
+        let result = write_safely(&link, &ws, b"evil");
         assert!(
             result.is_err(),
             "O_NOFOLLOW should reject writing through a symlink"
         );
         // Verify the original file was not modified.
         assert_eq!(fs::read_to_string(&target).unwrap(), "original");
+    }
+
+    /// Verify that the /proc post-open check catches a file that was swapped
+    /// to a path outside the workspace after O_NOFOLLOW opened it normally.
+    ///
+    /// This is an indirect test: we confirm that `open_safely` on a regular
+    /// in-workspace file succeeds and that `/proc/self/fd/{fd}` reports a
+    /// path within the workspace.  A true TOCTOU ancestor-swap race cannot be
+    /// reproduced deterministically, but this confirms the verification path
+    /// is exercised on Linux.
+    #[cfg(all(unix, target_os = "linux"))]
+    #[test]
+    fn test_open_safely_fd_verification_passes_for_workspace_file() {
+        let (_tmp, ws) = make_workspace();
+        let file = ws.join("check.txt");
+        fs::write(&file, "data").unwrap();
+
+        // open_safely must succeed — /proc check should confirm the path is
+        // within the workspace.
+        let result = open_safely(&file, &ws);
+        assert!(
+            result.is_ok(),
+            "open_safely must accept a regular in-workspace file: {:?}",
+            result
+        );
     }
 
     // ── normalize_lexical ─────────────────────────────────────────────────

@@ -18,7 +18,7 @@ use tracing::debug;
 use steward_types::actions::{PermissionTier, ToolDefinition, ToolResult, ToolSource};
 use steward_types::errors::StewardError;
 
-use crate::built_in::workspace::{open_file_no_follow, validate_path, workspace_root};
+use crate::built_in::workspace::{open_safely, validate_path, workspace_root};
 use crate::registry::BuiltInHandler;
 
 /// Default number of lines returned when the caller does not specify a limit.
@@ -120,12 +120,12 @@ impl BuiltInHandler for FileReadTool {
             .unwrap_or(DEFAULT_LINE_LIMIT)
             .min(MAX_LINE_LIMIT);
 
-        // 3. Open with O_NOFOLLOW to close the TOCTOU window between validate_path
-        //    and the actual open syscall.  If a symlink is swapped in at safe_path
-        //    between validation and open, the kernel returns ELOOP immediately.
+        // 3. Open with O_NOFOLLOW + post-open /proc/self/fd verification to
+        //    eliminate both final-component and ancestor-directory TOCTOU races.
         let std_file = tokio::task::spawn_blocking({
             let path = safe_path;
-            move || open_file_no_follow(&path)
+            let workspace = self.workspace.clone();
+            move || open_safely(&path, &workspace)
         })
         .await
         .map_err(|e| StewardError::Tool(format!("cannot read {}: {e}", params.path)))?
@@ -335,23 +335,21 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn test_symlink_rejected_by_nofollow() {
+    async fn test_symlink_rejected_by_open_safely() {
         let tmp = tempfile::tempdir().unwrap();
         let real = tmp.path().join("real.txt");
         fs::write(&real, "data").unwrap();
 
         // Symlink within workspace pointing to a real file within workspace.
-        // validate_path resolves this to the real path; O_NOFOLLOW then guards
-        // against a race where the real path itself is swapped for a symlink.
-        // We test the helper directly: open_file_no_follow must reject symlinks.
+        // O_NOFOLLOW in open_safely catches the final-component symlink swap.
         let link = tmp.path().join("link.txt");
         std::os::unix::fs::symlink(&real, &link).unwrap();
 
-        // Opening the symlink directly (as O_NOFOLLOW sees it) must fail.
-        let result = open_file_no_follow(&link);
+        // Opening the symlink directly must fail (O_NOFOLLOW returns ELOOP).
+        let result = open_safely(&link, tmp.path());
         assert!(
             result.is_err(),
-            "O_NOFOLLOW must reject a symlink final component"
+            "open_safely must reject a symlink final component"
         );
     }
 
