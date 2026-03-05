@@ -7,6 +7,8 @@
 //!
 //! Permission tier: LogAndExecute (arbitrary URL access, read-only, audited).
 
+use std::net::{IpAddr, ToSocketAddrs};
+
 use async_trait::async_trait;
 use regex::Regex;
 use reqwest::Client;
@@ -21,8 +23,44 @@ use crate::registry::BuiltInHandler;
 /// Default maximum characters to return from a fetched page.
 const DEFAULT_MAX_CHARS: usize = 8000;
 
+/// Hard cap on response body size: 1 MiB.
+const MAX_BODY_BYTES: usize = 1024 * 1024;
+
 /// Request timeout in seconds.
 const TIMEOUT_SECS: u64 = 30;
+
+/// Returns `true` if `ip` falls in a private, loopback, or link-local range.
+///
+/// Blocked IPv4 ranges:
+/// - 127.0.0.0/8    — loopback
+/// - 10.0.0.0/8     — RFC-1918 private
+/// - 172.16.0.0/12  — RFC-1918 private
+/// - 192.168.0.0/16 — RFC-1918 private
+/// - 169.254.0.0/16 — link-local / cloud IMDS
+///
+/// Blocked IPv6 ranges:
+/// - ::1       — loopback
+/// - fc00::/7  — ULA (unique local)
+fn is_private_or_internal(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            v4.is_loopback()
+                || v4.is_unspecified()
+                || v4.is_multicast()
+                || o[0] == 10
+                || (o[0] == 172 && (16..=31).contains(&o[1]))
+                || (o[0] == 192 && o[1] == 168)
+                || (o[0] == 169 && o[1] == 254)
+        }
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || (v6.segments()[0] & 0xfe00) == 0xfc00
+        }
+    }
+}
 
 /// Web fetch tool — retrieves a URL and extracts plain text content.
 ///
@@ -71,6 +109,51 @@ impl WebFetchTool {
         }
     }
 
+    /// Validate a URL against SSRF attack vectors.
+    ///
+    /// Rejects:
+    /// - Non-http/https schemes (e.g. `file://`, `ftp://`)
+    /// - URLs that resolve to private, loopback, or link-local IP addresses
+    fn validate_url_safety(url: &str) -> Result<(), StewardError> {
+        // Parse URL.
+        let parsed = reqwest::Url::parse(url)
+            .map_err(|e| StewardError::Tool(format!("invalid URL: {e}")))?;
+
+        // Only http and https are permitted.
+        match parsed.scheme() {
+            "http" | "https" => {}
+            scheme => {
+                return Err(StewardError::Tool(format!(
+                    "URL scheme '{scheme}' is not allowed; only http and https are permitted"
+                )));
+            }
+        }
+
+        // Extract hostname.
+        let host = parsed
+            .host_str()
+            .ok_or_else(|| StewardError::Tool("URL has no host".to_string()))?;
+
+        // Resolve hostname to socket addresses via std::net.
+        let port = parsed.port_or_known_default().unwrap_or(80);
+        let addrs = (host, port)
+            .to_socket_addrs()
+            .map_err(|e| StewardError::Tool(format!("failed to resolve host '{host}': {e}")))?;
+
+        // Block any resolution to a private or internal IP.
+        for addr in addrs {
+            let ip = addr.ip();
+            if is_private_or_internal(ip) {
+                warn!(url = %url, ip = %ip, "blocked SSRF attempt to private/internal IP");
+                return Err(StewardError::Tool(format!(
+                    "URL is blocked: resolves to a private or internal IP address ({ip})"
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
     /// Strip HTML tags from content and decode common HTML entities.
     ///
     /// Steps:
@@ -111,18 +194,14 @@ impl WebFetchTool {
         text.trim().to_string()
     }
 
-    /// Truncate `text` to at most `max_chars` characters, respecting UTF-8
-    /// char boundaries.
+    /// Truncate `text` to at most `max_chars` Unicode scalar values.
+    ///
+    /// Returns `(truncated_string, was_truncated)`.
     fn truncate(text: String, max_chars: usize) -> (String, bool) {
-        if text.len() <= max_chars {
-            return (text, false);
-        }
-        // Walk back from max_chars until we land on a char boundary.
-        let mut end = max_chars;
-        while !text.is_char_boundary(end) {
-            end -= 1;
-        }
-        (text[..end].to_string(), true)
+        let mut chars = text.chars();
+        let out: String = chars.by_ref().take(max_chars).collect();
+        let is_truncated = chars.next().is_some();
+        (out, is_truncated)
     }
 }
 
@@ -140,11 +219,14 @@ impl BuiltInHandler for WebFetchTool {
     /// Flow:
     /// 1. Parse `{"url": "...", "max_chars": N}` from JSON parameters
     /// 2. Reject empty URL
-    /// 3. Send GET request with a 30-second timeout
-    /// 4. Return error on non-2xx status
-    /// 5. Strip HTML tags if the content type is HTML
-    /// 6. Truncate to `max_chars` (default 8000)
-    /// 7. Return structured result with `text`, `url`, `truncated`, `content_type`
+    /// 3. Validate URL safety (SSRF protection: scheme + IP range check)
+    /// 4. Send GET request with a 30-second timeout
+    /// 5. Return error on non-2xx status
+    /// 6. Reject early if Content-Length exceeds 1 MiB
+    /// 7. Read body bytes with a 1 MiB hard cap
+    /// 8. Strip HTML tags if the content type is HTML
+    /// 9. Truncate to `max_chars` Unicode characters (default 8000)
+    /// 10. Return structured result with `text`, `url`, `truncated`, `content_type`
     async fn execute(&self, parameters: serde_json::Value) -> Result<ToolResult, StewardError> {
         // 1. Parse parameters.
         let params: WebFetchParams = serde_json::from_value(parameters)
@@ -156,17 +238,20 @@ impl BuiltInHandler for WebFetchTool {
             return Err(StewardError::Tool("URL cannot be empty".to_string()));
         }
 
+        // 3. Validate URL safety (SSRF protection).
+        Self::validate_url_safety(&url)?;
+
         let max_chars = params.max_chars.unwrap_or(DEFAULT_MAX_CHARS);
 
         debug!(url = %url, max_chars = max_chars, "fetching URL");
 
-        // 3. Send GET request.
+        // 4. Send GET request.
         let response = self.client.get(&url).send().await.map_err(|e| {
             warn!(error = %e, url = %url, "web fetch request failed");
             StewardError::Tool(format!("failed to fetch URL '{url}': {e}"))
         })?;
 
-        // 4. Return error on non-2xx status.
+        // 5. Return error on non-2xx status.
         let status = response.status();
         if !status.is_success() {
             return Ok(ToolResult {
@@ -186,12 +271,30 @@ impl BuiltInHandler for WebFetchTool {
             .unwrap_or("")
             .to_lowercase();
 
-        let body = response
-            .text()
+        // 6. Reject oversized responses early using Content-Length header.
+        if let Some(content_length) = response.content_length() {
+            if content_length as usize > MAX_BODY_BYTES {
+                return Err(StewardError::Tool(format!(
+                    "response too large: Content-Length {content_length} exceeds 1 MiB limit"
+                )));
+            }
+        }
+
+        // 7. Read body bytes with a hard 1 MiB cap.
+        let body_bytes = response
+            .bytes()
             .await
             .map_err(|e| StewardError::Tool(format!("failed to read response body: {e}")))?;
 
-        // 5. Strip HTML if applicable.
+        if body_bytes.len() > MAX_BODY_BYTES {
+            return Err(StewardError::Tool(
+                "response body exceeds 1 MiB limit".to_string(),
+            ));
+        }
+
+        let body = String::from_utf8_lossy(&body_bytes).into_owned();
+
+        // 8. Strip HTML if applicable.
         let is_html = content_type.contains("text/html") || content_type.is_empty();
         let text = if is_html {
             Self::strip_html(&body)
@@ -199,10 +302,10 @@ impl BuiltInHandler for WebFetchTool {
             body
         };
 
-        // 6. Truncate to max_chars.
+        // 9. Truncate to max_chars Unicode characters.
         let (text, truncated) = Self::truncate(text, max_chars);
 
-        // 7. Return structured result.
+        // 10. Return structured result.
         Ok(ToolResult {
             success: true,
             output: serde_json::json!({
@@ -243,6 +346,119 @@ mod tests {
         let required = def.input_schema["required"].as_array().unwrap();
         assert!(!required.iter().any(|v| v.as_str() == Some("max_chars")));
         assert!(def.input_schema["properties"]["max_chars"].is_object());
+    }
+
+    // ========== SSRF URL safety ==========
+
+    #[test]
+    fn test_ssrf_blocks_localhost() {
+        // localhost resolves to 127.0.0.1 via /etc/hosts
+        assert!(
+            WebFetchTool::validate_url_safety("http://localhost/").is_err(),
+            "localhost should be blocked"
+        );
+    }
+
+    #[test]
+    fn test_ssrf_blocks_127_0_0_1() {
+        assert!(
+            WebFetchTool::validate_url_safety("http://127.0.0.1/").is_err(),
+            "127.0.0.1 should be blocked"
+        );
+    }
+
+    #[test]
+    fn test_ssrf_blocks_imds_169_254_169_254() {
+        // AWS/GCP/Azure instance metadata service
+        assert!(
+            WebFetchTool::validate_url_safety("http://169.254.169.254/latest/meta-data/").is_err(),
+            "169.254.169.254 should be blocked"
+        );
+    }
+
+    #[test]
+    fn test_ssrf_blocks_private_10_range() {
+        assert!(WebFetchTool::validate_url_safety("http://10.0.0.1/").is_err());
+    }
+
+    #[test]
+    fn test_ssrf_blocks_private_172_range() {
+        assert!(WebFetchTool::validate_url_safety("http://172.16.0.1/").is_err());
+        assert!(WebFetchTool::validate_url_safety("http://172.31.255.255/").is_err());
+    }
+
+    #[test]
+    fn test_ssrf_blocks_private_192_168_range() {
+        assert!(WebFetchTool::validate_url_safety("http://192.168.1.1/").is_err());
+    }
+
+    #[test]
+    fn test_ssrf_blocks_file_scheme() {
+        assert!(WebFetchTool::validate_url_safety("file:///etc/passwd").is_err());
+    }
+
+    #[test]
+    fn test_ssrf_blocks_ftp_scheme() {
+        assert!(WebFetchTool::validate_url_safety("ftp://example.com/").is_err());
+    }
+
+    #[test]
+    fn test_ssrf_allows_public_ip() {
+        // 1.1.1.1 is Cloudflare DNS — a known public IP
+        assert!(
+            WebFetchTool::validate_url_safety("https://1.1.1.1/").is_ok(),
+            "public IP 1.1.1.1 should be allowed"
+        );
+    }
+
+    // ========== IP range classification ==========
+
+    #[test]
+    fn test_is_private_blocks_loopback_ipv4() {
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+        assert!(is_private_or_internal(ip));
+    }
+
+    #[test]
+    fn test_is_private_blocks_rfc1918() {
+        for addr in &[
+            "10.0.0.1",
+            "10.255.255.255",
+            "172.16.0.1",
+            "172.31.255.255",
+            "192.168.0.1",
+            "192.168.255.255",
+        ] {
+            let ip: IpAddr = addr.parse().unwrap();
+            assert!(is_private_or_internal(ip), "{addr} should be private");
+        }
+    }
+
+    #[test]
+    fn test_is_private_blocks_link_local() {
+        let ip: IpAddr = "169.254.169.254".parse().unwrap();
+        assert!(is_private_or_internal(ip));
+    }
+
+    #[test]
+    fn test_is_private_blocks_ipv6_loopback() {
+        let ip: IpAddr = "::1".parse().unwrap();
+        assert!(is_private_or_internal(ip));
+    }
+
+    #[test]
+    fn test_is_private_blocks_ipv6_ula() {
+        // fc00::/7 covers fc00:: through fdff::
+        let ip: IpAddr = "fd12:3456:789a:1::1".parse().unwrap();
+        assert!(is_private_or_internal(ip));
+    }
+
+    #[test]
+    fn test_is_private_allows_public_ips() {
+        for addr in &["1.1.1.1", "8.8.8.8", "208.67.222.222"] {
+            let ip: IpAddr = addr.parse().unwrap();
+            assert!(!is_private_or_internal(ip), "{addr} should be public");
+        }
     }
 
     // ========== HTML stripping ==========
@@ -353,14 +569,15 @@ mod tests {
     }
 
     #[test]
-    fn test_truncate_respects_char_boundary() {
-        // 3-byte UTF-8 character (€ = 0xE2 0x82 0xAC)
-        let euro = "€"; // 3 bytes
-        let text = euro.repeat(3000); // 9000 bytes, 3000 chars
+    fn test_truncate_multibyte_chars_counted_correctly() {
+        // € is 3 bytes but 1 Unicode scalar value.
+        // 10_000 chars × 3 bytes = 30_000 bytes, well over max_chars=8000 chars.
+        let text = "€".repeat(10_000);
         let (out, truncated) = WebFetchTool::truncate(text, 8000);
-        // Should truncate to the last complete char before byte 8000
-        // 8000 / 3 = 2666 full chars = 7998 bytes
-        assert!(out.is_empty() || out.is_char_boundary(out.len()));
+        // Exactly 8000 Unicode characters must be returned.
+        assert_eq!(out.chars().count(), 8000);
+        // Each € is 3 bytes → byte length must be 24_000.
+        assert_eq!(out.len(), 24_000);
         assert!(truncated);
     }
 

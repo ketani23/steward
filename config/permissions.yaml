@@ -10,7 +10,6 @@ tiers:
       - email.read
       - weather.check
       - memory.search
-      - web.search
     constraints:
       rate_limit: 60/minute
 
@@ -21,6 +20,7 @@ tiers:
       - note.create
       - message.draft
       - file.read
+      - web.search
       - web.fetch
       # Safe, read-only shell commands that do not modify system state.
       # These require the ShellTool to emit "shell.exec.readonly" as its tool_name
