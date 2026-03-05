@@ -82,10 +82,10 @@ impl BuiltInHandler for FileWriteTool {
     ///
     /// Flow:
     /// 1. Parse `{"path": "...", "content": "..."}` from JSON.
-    /// 2. Validate path against workspace root.
-    /// 3. Create parent directories as needed.
-    /// 4. Write content to the file.
-    /// 5. Return confirmation with bytes written.
+    /// 2. Validate path against workspace root (lexical + ancestor check).
+    /// 3. Write content via openat chain — creates parent dirs and the file
+    ///    atomically with `O_NOFOLLOW` at every step (no TOCTOU window).
+    /// 4. Return confirmation with bytes written.
     async fn execute(&self, parameters: serde_json::Value) -> Result<ToolResult, StewardError> {
         // 1. Parse parameters.
         let params: FileWriteParams = serde_json::from_value(parameters)
@@ -96,33 +96,9 @@ impl BuiltInHandler for FileWriteTool {
 
         debug!(path = %safe_path.display(), "file.write executing");
 
-        // 3. Create parent directories, then re-canonicalize and re-verify
-        //    the parent to guard against a symlink race between
-        //    validate_write_path and create_dir_all.
-        if let Some(parent) = safe_path.parent() {
-            tokio::fs::create_dir_all(parent).await.map_err(|e| {
-                StewardError::Tool(format!(
-                    "cannot create parent directories for {}: {e}",
-                    params.path
-                ))
-            })?;
-
-            let canonical_parent = tokio::fs::canonicalize(parent).await.map_err(|e| {
-                StewardError::Tool(format!("cannot canonicalize parent directory: {e}"))
-            })?;
-            let canonical_ws = tokio::fs::canonicalize(&self.workspace)
-                .await
-                .map_err(|e| StewardError::Tool(format!("cannot canonicalize workspace: {e}")))?;
-            if !canonical_parent.starts_with(&canonical_ws) {
-                return Err(StewardError::Tool(format!(
-                    "parent directory is outside workspace: {}",
-                    params.path
-                )));
-            }
-        }
-
-        // 4. Write content with O_NOFOLLOW + post-open /proc/self/fd verification
-        //    to eliminate both final-component and ancestor-directory TOCTOU races.
+        // 3. Write content via openat chain.  write_safely atomically creates
+        //    any missing parent directories with mkdirat and opens the file
+        //    with O_NOFOLLOW at every step, eliminating TOCTOU races entirely.
         let bytes = params.content.len();
         {
             let path = safe_path;

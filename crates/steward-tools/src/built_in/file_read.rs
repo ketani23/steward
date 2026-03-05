@@ -100,9 +100,10 @@ impl BuiltInHandler for FileReadTool {
     /// Flow:
     /// 1. Parse `{"path": "...", "offset": N, "limit": M}` from JSON.
     /// 2. Validate path against workspace root.
-    /// 3. Read file contents from disk.
-    /// 4. Apply offset (skip lines) and limit (max lines).
-    /// 5. Return content with metadata (line count, truncated flag).
+    /// 3. Return empty immediately if `limit == 0`.
+    /// 4. Open file via openat chain (no symlink at any step).
+    /// 5. Apply offset (skip lines) and limit (max lines).
+    /// 6. Return content with metadata (line count, truncated flag).
     async fn execute(&self, parameters: serde_json::Value) -> Result<ToolResult, StewardError> {
         // 1. Parse parameters.
         let params: FileReadParams = serde_json::from_value(parameters)
@@ -120,8 +121,24 @@ impl BuiltInHandler for FileReadTool {
             .unwrap_or(DEFAULT_LINE_LIMIT)
             .min(MAX_LINE_LIMIT);
 
-        // 3. Open with O_NOFOLLOW + post-open /proc/self/fd verification to
-        //    eliminate both final-component and ancestor-directory TOCTOU races.
+        // limit=0 means the caller requested nothing.  validate_path already
+        // confirmed the file exists; return empty content immediately.
+        if limit == 0 {
+            return Ok(ToolResult {
+                success: true,
+                output: serde_json::json!({
+                    "content": "",
+                    "path": params.path,
+                    "lines_shown": skip,
+                    "lines_returned": 0_usize,
+                    "offset": skip + 1,
+                    "truncated": true,
+                }),
+                error: None,
+            });
+        }
+
+        // 3. Open via openat chain — no symlink at any path component is followed.
         let std_file = tokio::task::spawn_blocking({
             let path = safe_path;
             let workspace = self.workspace.clone();
@@ -258,6 +275,28 @@ mod tests {
         assert!(!content.contains('a'));
         assert!(!content.contains('b'));
         assert!(content.contains('c'));
+    }
+
+    #[tokio::test]
+    async fn test_limit_zero_returns_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("data.txt");
+        fs::write(&file, "line1\nline2\nline3\n").unwrap();
+
+        let result = tool(tmp.path())
+            .execute(serde_json::json!({"path": "data.txt", "limit": 0}))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert_eq!(
+            result.output["lines_returned"], 0,
+            "limit=0 must return 0 lines"
+        );
+        assert_eq!(
+            result.output["content"], "",
+            "limit=0 must return empty content"
+        );
     }
 
     #[tokio::test]

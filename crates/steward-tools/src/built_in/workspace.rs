@@ -62,65 +62,74 @@ pub fn validate_write_path(requested: &str, workspace: &Path) -> Result<PathBuf,
     Ok(final_path)
 }
 
-/// Open a file for reading with comprehensive TOCTOU protection.
+/// Open a file for reading using the openat chain approach.
 ///
-/// Two layers of protection:
-/// 1. `O_NOFOLLOW` — the kernel refuses to follow a symlink at the final path
-///    component, catching last-component symlink swaps.
-/// 2. Post-open `/proc/self/fd/{fd}` verification (Linux) — reads the real
-///    path of the file descriptor and confirms it is inside `workspace`,
-///    catching ancestor-directory symlink swaps that occur between
-///    path validation and the actual `open(2)` syscall.
+/// Eliminates TOCTOU races entirely: the workspace root is opened as a
+/// directory fd, then each path component of `rel` is resolved via `openat`
+/// with `O_NOFOLLOW`.  No path component is ever followed as a symlink, and
+/// the kernel performs each step atomically relative to the parent fd.
+///
+/// `path` must be the canonical absolute path returned by [`validate_path`].
 #[cfg(unix)]
 pub fn open_safely(path: &Path, workspace: &Path) -> std::io::Result<std::fs::File> {
-    use std::os::unix::fs::OpenOptionsExt as _;
-    use std::os::unix::io::AsRawFd as _;
-
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)?;
-
-    verify_fd_within_workspace(file.as_raw_fd(), workspace)?;
-    Ok(file)
+    let canonical_workspace = std::fs::canonicalize(workspace)?;
+    let rel = path.strip_prefix(&canonical_workspace).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "path is outside workspace",
+        )
+    })?;
+    openat_chain(&canonical_workspace, rel, libc::O_RDONLY, 0)
 }
 
-/// Fallback for non-Unix platforms where `O_NOFOLLOW` is unavailable.
+/// Fallback for non-Unix platforms where `openat` is unavailable.
 #[cfg(not(unix))]
 pub fn open_safely(path: &Path, _workspace: &Path) -> std::io::Result<std::fs::File> {
     std::fs::File::open(path)
 }
 
-/// Write `content` to `path` with comprehensive TOCTOU protection.
+/// Write `content` to `path` using openat chain + mkdirat for parent dirs.
 ///
-/// Like [`open_safely`] but for writes: opens with `O_NOFOLLOW | O_CREAT`
-/// **without** `O_TRUNC` so that if the subsequent workspace verification
-/// fails we have not modified any existing file content.  Only after
-/// [`verify_fd_within_workspace`] passes do we truncate via
-/// [`std::fs::File::set_len`] and write.
+/// Parent directories are created atomically using `mkdirat` relative to the
+/// workspace root fd.  The file itself is opened via `openat` with
+/// `O_NOFOLLOW | O_CREAT`, ensuring no symlink at any path component can
+/// redirect the write outside the workspace.
 ///
-/// If verification fails the file descriptor is simply closed (dropped) —
-/// the file on disk is left untouched.  We do **not** attempt to delete it
-/// because the path might refer to an external file we have no business
-/// removing.
+/// We do **not** open with `O_TRUNC` so that if a subsequent step fails the
+/// existing file content remains intact.  We truncate manually via
+/// [`std::fs::File::set_len`] only after the fd is confirmed safe.
+///
+/// `path` must be the validated absolute path returned by [`validate_write_path`].
 #[cfg(unix)]
 pub fn write_safely(path: &Path, workspace: &Path, content: &[u8]) -> std::io::Result<()> {
     use std::io::Seek as _;
     use std::io::Write as _;
-    use std::os::unix::fs::OpenOptionsExt as _;
-    use std::os::unix::io::AsRawFd as _;
 
-    // Open WITHOUT truncate — if verification fails, existing content is intact.
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)?;
+    let canonical_workspace = std::fs::canonicalize(workspace)?;
+    let rel = path.strip_prefix(&canonical_workspace).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "path is outside workspace",
+        )
+    })?;
 
-    // Verify AFTER open; on failure just drop the fd without touching the file.
-    verify_fd_within_workspace(file.as_raw_fd(), workspace)?;
+    // Create parent directories atomically via mkdirat chain.
+    if let Some(parent) = rel.parent() {
+        if !parent.as_os_str().is_empty() {
+            mkdirat_chain(&canonical_workspace, parent)?;
+        }
+    }
 
-    // Path is confirmed safe — now truncate and write.
+    // Open / create the file.  O_NOFOLLOW is added by openat_chain for the
+    // final component.  No O_TRUNC — we truncate manually below.
+    let mut file = openat_chain(
+        &canonical_workspace,
+        rel,
+        libc::O_WRONLY | libc::O_CREAT,
+        0o644,
+    )?;
+
+    // Truncate and write.
     file.set_len(0)?;
     file.seek(std::io::SeekFrom::Start(0))?;
     file.write_all(content)
@@ -132,38 +141,176 @@ pub fn write_safely(path: &Path, _workspace: &Path, content: &[u8]) -> std::io::
     std::fs::write(path, content)
 }
 
-/// Verify that the file descriptor's real path is within the workspace.
+// ─────────────────────────── openat chain helpers ─────────────────────────
+
+/// RAII wrapper for a raw Unix file descriptor.
 ///
-/// On Linux, `/proc/self/fd/{fd}` is a symlink to the actual path of the open
-/// file as seen by the kernel.  Reading it after `open(2)` and comparing with
-/// the canonical workspace root eliminates the TOCTOU window: even if an
-/// ancestor directory was replaced by a symlink between our pre-open
-/// `validate_path` check and the actual open syscall, the fd will point to
-/// the true location which we can then verify.
-///
-/// On non-Linux systems this is a no-op; `O_NOFOLLOW` (applied by the
-/// callers) remains the best available protection.
+/// Closes the descriptor on drop.  Use [`OwnedFd::into_raw`] to transfer
+/// ownership out (e.g. to [`std::fs::File::from_raw_fd`]).
 #[cfg(unix)]
-fn verify_fd_within_workspace(
-    fd: std::os::unix::io::RawFd,
-    workspace: &Path,
-) -> std::io::Result<()> {
-    #[cfg(target_os = "linux")]
-    {
-        let canonical_workspace = std::fs::canonicalize(workspace)?;
-        let real_path = std::fs::read_link(format!("/proc/self/fd/{fd}"))?;
-        if !real_path.starts_with(&canonical_workspace) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                format!("opened path is outside workspace: {}", real_path.display()),
-            ));
+struct OwnedFd(libc::c_int);
+
+#[cfg(unix)]
+impl OwnedFd {
+    /// Wrap a raw fd, returning an error if `fd < 0`.
+    fn new(fd: libc::c_int) -> std::io::Result<Self> {
+        if fd < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(Self(fd))
         }
     }
-    #[cfg(not(target_os = "linux"))]
-    {
-        // Suppress unused variable warnings on non-Linux Unix.
-        let _ = (fd, workspace);
+
+    fn as_raw(&self) -> libc::c_int {
+        self.0
     }
+
+    /// Transfer ownership, preventing the Drop from closing the fd.
+    fn into_raw(self) -> libc::c_int {
+        let fd = self.0;
+        std::mem::forget(self);
+        fd
+    }
+}
+
+#[cfg(unix)]
+impl Drop for OwnedFd {
+    fn drop(&mut self) {
+        // SAFETY: we own this fd exclusively.
+        unsafe { libc::close(self.0) };
+    }
+}
+
+/// Convert an [`OsStr`](std::ffi::OsStr) path component to a `CString`.
+#[cfg(unix)]
+fn osstr_to_cstring(s: &std::ffi::OsStr) -> std::io::Result<std::ffi::CString> {
+    use std::os::unix::ffi::OsStrExt as _;
+    std::ffi::CString::new(s.as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "path component contains null byte",
+        )
+    })
+}
+
+/// Flags for opening an intermediate directory in the openat chain.
+///
+/// `O_PATH` (Linux) gives a lightweight fd usable as a `dirfd` without
+/// accessing file content.  On other Unix we use `O_RDONLY | O_DIRECTORY`
+/// which is heavier but portable.  `O_NOFOLLOW` prevents symlink traversal.
+/// `O_CLOEXEC` avoids leaking fds into child processes.
+#[cfg(unix)]
+fn dir_open_flags() -> libc::c_int {
+    #[cfg(target_os = "linux")]
+    return libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    #[cfg(not(target_os = "linux"))]
+    return libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+}
+
+/// Open a file via an openat chain rooted at `workspace`.
+///
+/// Opens `workspace` as a directory fd, then for each component of `rel`:
+/// * Intermediate components: `openat` with [`dir_open_flags`] (no symlinks).
+/// * Final component: `openat` with `flags | O_NOFOLLOW | O_CLOEXEC`.
+///
+/// Because every step uses `O_NOFOLLOW` and is resolved relative to the parent
+/// fd, the kernel prevents any symlink swap at any point in the chain.
+#[cfg(unix)]
+fn openat_chain(
+    workspace: &Path,
+    rel: &Path,
+    flags: libc::c_int,
+    mode: libc::mode_t,
+) -> std::io::Result<std::fs::File> {
+    use std::os::unix::io::FromRawFd as _;
+
+    let ws_cstr = osstr_to_cstring(workspace.as_os_str())?;
+    let mut current = OwnedFd::new(unsafe { libc::open(ws_cstr.as_ptr(), dir_open_flags()) })?;
+
+    let components: Vec<_> = rel.components().collect();
+    let n = components.len();
+    if n == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "relative path must not be empty",
+        ));
+    }
+
+    for (i, component) in components.iter().enumerate() {
+        let is_last = i + 1 == n;
+        let name = match component {
+            std::path::Component::Normal(name) => *name,
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "path must contain only normal components",
+                ))
+            }
+        };
+        let name_cstr = osstr_to_cstring(name)?;
+
+        let next = if is_last {
+            // Final component: open with caller flags + O_NOFOLLOW.
+            OwnedFd::new(unsafe {
+                libc::openat(
+                    current.as_raw(),
+                    name_cstr.as_ptr(),
+                    flags | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                    mode,
+                )
+            })?
+        } else {
+            // Intermediate directory: O_NOFOLLOW prevents symlink traversal.
+            OwnedFd::new(unsafe {
+                libc::openat(current.as_raw(), name_cstr.as_ptr(), dir_open_flags(), 0)
+            })?
+        };
+        current = next; // previous fd dropped here
+    }
+
+    // SAFETY: current holds the final file fd; we transfer ownership.
+    Ok(unsafe { std::fs::File::from_raw_fd(current.into_raw()) })
+}
+
+/// Create a directory hierarchy relative to `workspace` using `mkdirat`.
+///
+/// Walks each component of `dir_rel`, calling `mkdirat` for each level.
+/// Existing directories are silently accepted (`EEXIST`).  Any path component
+/// that resolves to a symlink causes an error because the subsequent `openat`
+/// with `O_NOFOLLOW | O_DIRECTORY` will fail with `ELOOP`.
+#[cfg(unix)]
+fn mkdirat_chain(workspace: &Path, dir_rel: &Path) -> std::io::Result<()> {
+    let ws_cstr = osstr_to_cstring(workspace.as_os_str())?;
+    let mut current = OwnedFd::new(unsafe { libc::open(ws_cstr.as_ptr(), dir_open_flags()) })?;
+
+    for component in dir_rel.components() {
+        let name = match component {
+            std::path::Component::Normal(name) => name,
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "path must contain only normal components",
+                ))
+            }
+        };
+        let name_cstr = osstr_to_cstring(name)?;
+
+        // Create the directory — EEXIST is fine (already present).
+        let ret = unsafe { libc::mkdirat(current.as_raw(), name_cstr.as_ptr(), 0o755) };
+        if ret != 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() != std::io::ErrorKind::AlreadyExists {
+                return Err(err);
+            }
+        }
+
+        // Open the directory as the next parent fd; O_NOFOLLOW rejects symlinks.
+        let next = OwnedFd::new(unsafe {
+            libc::openat(current.as_raw(), name_cstr.as_ptr(), dir_open_flags(), 0)
+        })?;
+        current = next;
+    }
+
     Ok(())
 }
 
