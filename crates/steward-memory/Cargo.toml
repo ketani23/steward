@@ -7,6 +7,7 @@ description = "Memory subsystem for Steward: PostgreSQL + pgvector persistent me
 [dependencies]
 steward-types.workspace = true
 async-trait.workspace = true
+reqwest.workspace = true
 sqlx.workspace = true
 tokio.workspace = true
 tracing.workspace = true

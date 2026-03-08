@@ -5,6 +5,8 @@
 /// - **Search**: Hybrid full-text + vector search with RRF fusion
 /// - **Provenance**: Memory origin tracking and trust scoring
 /// - **Integrity**: Periodic audit for memory poisoning detection
+/// - **Embedding**: OpenAI embedding provider for vector search
+pub mod embedding;
 pub mod integrity;
 pub mod provenance;
 pub mod search;

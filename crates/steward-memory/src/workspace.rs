@@ -64,6 +64,14 @@ ON memory_entries (trust_score)";
 /// - Trust score management with immutable core memory protection
 /// - Vector embedding storage via the pgvector extension
 /// - Bulk retrieval by provenance via [`get_by_provenance`](Self::get_by_provenance)
+///
+/// # Deprecation Notice
+///
+/// Prefer [`HybridMemorySearch`](crate::search::HybridMemorySearch) which implements
+/// both [`MemoryStore`] and [`MemorySearch`](steward_types::traits::MemorySearch) on the
+/// unified `memories` table. `PgMemoryStore` operates on a separate `memory_entries` table
+/// and will be removed in a future release.
+// TODO(deprecation): replace usages with HybridMemorySearch before removal
 pub struct PgMemoryStore {
     pool: PgPool,
 }
@@ -133,9 +141,27 @@ impl PgMemoryStore {
     }
 }
 
+/// Validate that a trust score is a finite value in `[0.0, 1.0]`.
+fn validate_trust_score(score: f64, field: &str) -> Result<(), StewardError> {
+    if score.is_nan() {
+        return Err(StewardError::Memory(format!("{field} must not be NaN")));
+    }
+    if !(0.0..=1.0).contains(&score) {
+        return Err(StewardError::Memory(format!(
+            "{field} must be in [0.0, 1.0], got {score}"
+        )));
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl MemoryStore for PgMemoryStore {
     async fn store(&self, entry: MemoryEntry) -> Result<MemoryId, StewardError> {
+        validate_trust_score(entry.trust_score, "trust_score")?;
+        if let Some(conf) = entry.confidence {
+            validate_trust_score(conf, "confidence")?;
+        }
+
         let id = entry.id.unwrap_or_else(Uuid::new_v4);
         let embedding: Option<Vector> = entry.embedding.map(Vector::from);
 
@@ -171,6 +197,8 @@ impl MemoryStore for PgMemoryStore {
     }
 
     async fn update_trust(&self, id: &MemoryId, score: f64) -> Result<(), StewardError> {
+        validate_trust_score(score, "trust_score")?;
+
         // Fetch provenance and current trust to check immutability
         let row = sqlx::query("SELECT provenance, trust_score FROM memory_entries WHERE id = $1")
             .bind(id)
@@ -258,6 +286,10 @@ fn row_to_entry(row: PgRow) -> Result<MemoryEntry, StewardError> {
             .try_get::<Option<Vector>, _>("embedding")
             .map_err(map_err)?
             .map(|v| v.to_vec()),
+        scope: None,
+        source_session: None,
+        source_channel: None,
+        confidence: None,
     })
 }
 
@@ -308,6 +340,38 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_trust_score_valid() {
+        assert!(validate_trust_score(0.0, "trust_score").is_ok());
+        assert!(validate_trust_score(0.5, "trust_score").is_ok());
+        assert!(validate_trust_score(1.0, "trust_score").is_ok());
+    }
+
+    #[test]
+    fn test_validate_trust_score_nan_rejected() {
+        let err = validate_trust_score(f64::NAN, "trust_score").unwrap_err();
+        assert!(err.to_string().contains("NaN"));
+    }
+
+    #[test]
+    fn test_validate_trust_score_negative_rejected() {
+        let err = validate_trust_score(-0.1, "trust_score").unwrap_err();
+        assert!(err.to_string().contains("trust_score"));
+        assert!(err.to_string().contains("[0.0, 1.0]"));
+    }
+
+    #[test]
+    fn test_validate_trust_score_above_one_rejected() {
+        let err = validate_trust_score(1.1, "trust_score").unwrap_err();
+        assert!(err.to_string().contains("[0.0, 1.0]"));
+    }
+
+    #[test]
+    fn test_validate_confidence_invalid_rejected() {
+        let err = validate_trust_score(2.0, "confidence").unwrap_err();
+        assert!(err.to_string().contains("confidence"));
+    }
+
+    #[test]
     fn test_provenance_to_str_values() {
         assert_eq!(
             provenance_to_str(MemoryProvenance::UserInstruction),
@@ -346,6 +410,10 @@ mod tests {
             trust_score: trust,
             created_at: Utc::now(),
             embedding: None,
+            scope: None,
+            source_session: None,
+            source_channel: None,
+            confidence: None,
         }
     }
 

@@ -178,10 +178,13 @@ pub trait MemorySearch: Send + Sync {
     /// Search memory using hybrid FTS + vector search with RRF scoring.
     ///
     /// Results are ranked by combined score, weighted by trust score.
+    /// If `scope` is `Some`, results are filtered to that scope (plus `'shared'`).
+    /// If `scope` is `None`, all scopes are searched.
     async fn search(
         &self,
         query: &str,
         limit: usize,
+        scope: Option<&str>,
     ) -> Result<Vec<MemorySearchResult>, StewardError>;
 }
 

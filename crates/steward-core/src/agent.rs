@@ -637,7 +637,7 @@ impl Agent {
 
     /// Retrieve relevant context from memory.
     async fn retrieve_context(&self, query: &str) -> Vec<MemorySearchResult> {
-        match self.memory.search(query, 5).await {
+        match self.memory.search(query, 5, None).await {
             Ok(results) => results,
             Err(e) => {
                 tracing::warn!(error = %e, "Memory search failed, continuing without context");
@@ -1454,6 +1454,7 @@ mod tests {
             &self,
             _query: &str,
             _limit: usize,
+            _scope: Option<&str>,
         ) -> Result<Vec<MemorySearchResult>, StewardError> {
             Ok(vec![])
         }
@@ -1467,6 +1468,7 @@ mod tests {
             &self,
             _query: &str,
             _limit: usize,
+            _scope: Option<&str>,
         ) -> Result<Vec<MemorySearchResult>, StewardError> {
             Ok(vec![MemorySearchResult {
                 entry: MemoryEntry {
@@ -1476,6 +1478,10 @@ mod tests {
                     trust_score: 1.0,
                     created_at: Utc::now(),
                     embedding: None,
+                    scope: None,
+                    source_session: None,
+                    source_channel: None,
+                    confidence: None,
                 },
                 score: 0.85,
                 fts_rank: Some(1),
@@ -2083,6 +2089,10 @@ mod tests {
                 trust_score: 1.0,
                 created_at: Utc::now(),
                 embedding: None,
+                scope: None,
+                source_session: None,
+                source_channel: None,
+                confidence: None,
             },
             score: 0.9,
             fts_rank: Some(1),

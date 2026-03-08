@@ -19,7 +19,7 @@ use uuid::Uuid;
 
 use steward_types::actions::{MemoryEntry, MemoryId, MemoryProvenance, MemorySearchResult};
 use steward_types::errors::StewardError;
-use steward_types::traits::MemorySearch;
+use steward_types::traits::{MemorySearch, MemoryStore};
 
 // ============================================================
 // SQL Migrations
@@ -38,8 +38,26 @@ CREATE TABLE IF NOT EXISTS memories (\
     provenance TEXT NOT NULL DEFAULT 'agent_observation', \
     trust_score DOUBLE PRECISION NOT NULL DEFAULT 0.5, \
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), \
-    embedding vector(1536)\
+    embedding vector(1536), \
+    scope TEXT NOT NULL DEFAULT 'shared', \
+    source_session UUID, \
+    source_channel TEXT, \
+    confidence DOUBLE PRECISION\
 )";
+
+/// ALTER TABLE migrations to add new columns to an existing `memories` table.
+///
+/// Safe to run multiple times — `ADD COLUMN IF NOT EXISTS` is idempotent.
+const ALTER_TABLE_MIGRATIONS: &[&str] = &[
+    "ALTER TABLE memories ADD COLUMN IF NOT EXISTS scope TEXT NOT NULL DEFAULT 'shared'",
+    "ALTER TABLE memories ADD COLUMN IF NOT EXISTS source_session UUID",
+    "ALTER TABLE memories ADD COLUMN IF NOT EXISTS source_channel TEXT",
+    "ALTER TABLE memories ADD COLUMN IF NOT EXISTS confidence DOUBLE PRECISION",
+    // Backfill: ensure any pre-existing NULL scope values are set and column is NOT NULL.
+    "UPDATE memories SET scope = 'shared' WHERE scope IS NULL",
+    "ALTER TABLE memories ALTER COLUMN scope SET NOT NULL",
+    "ALTER TABLE memories ALTER COLUMN scope SET DEFAULT 'shared'",
+];
 
 /// SQL migrations for the search module.
 ///
@@ -215,6 +233,39 @@ fn provenance_from_str(s: &str) -> MemoryProvenance {
     }
 }
 
+/// Convert a [`MemoryProvenance`] enum to its snake_case database string.
+pub(crate) fn provenance_to_str(p: MemoryProvenance) -> &'static str {
+    match p {
+        MemoryProvenance::UserInstruction => "user_instruction",
+        MemoryProvenance::AgentObservation => "agent_observation",
+        MemoryProvenance::ExternalContent => "external_content",
+        MemoryProvenance::ToolResult => "tool_result",
+    }
+}
+
+/// Validate that a score field is finite and within [0.0, 1.0].
+///
+/// Returns `StewardError::Memory` for NaN or out-of-range values.
+fn validate_trust_score(score: f64, field: &str) -> Result<(), StewardError> {
+    if score.is_nan() {
+        return Err(StewardError::Memory(format!("{field} must not be NaN")));
+    }
+    if !(0.0..=1.0).contains(&score) {
+        return Err(StewardError::Memory(format!(
+            "{field} must be in [0.0, 1.0], got {score}"
+        )));
+    }
+    Ok(())
+}
+
+/// Check if a memory entry is in the immutable core memory tier.
+///
+/// Only entries with provenance `user_instruction` **and** `trust_score == 1.0` are
+/// considered immutable. A `user_instruction` entry below max trust is still mutable.
+fn is_immutable_core_memory(provenance: &str, trust_score: f64) -> bool {
+    provenance == "user_instruction" && (trust_score - 1.0).abs() < f64::EPSILON
+}
+
 // ============================================================
 // Database Row Extraction
 // ============================================================
@@ -227,6 +278,10 @@ struct SearchCandidate {
     trust_score: f64,
     created_at: DateTime<Utc>,
     embedding_text: Option<String>,
+    scope: Option<String>,
+    source_session: Option<Uuid>,
+    source_channel: Option<String>,
+    confidence: Option<f64>,
 }
 
 /// Extract a `SearchCandidate` from a `sqlx::postgres::PgRow`.
@@ -250,6 +305,18 @@ fn candidate_from_row(row: &sqlx::postgres::PgRow) -> Result<SearchCandidate, St
         embedding_text: row
             .try_get("embedding_text")
             .map_err(|e| StewardError::Database(format!("missing column 'embedding_text': {e}")))?,
+        scope: row
+            .try_get("scope")
+            .map_err(|e| StewardError::Database(format!("missing column 'scope': {e}")))?,
+        source_session: row
+            .try_get("source_session")
+            .map_err(|e| StewardError::Database(format!("missing column 'source_session': {e}")))?,
+        source_channel: row
+            .try_get("source_channel")
+            .map_err(|e| StewardError::Database(format!("missing column 'source_channel': {e}")))?,
+        confidence: row
+            .try_get("confidence")
+            .map_err(|e| StewardError::Database(format!("missing column 'confidence': {e}")))?,
     })
 }
 
@@ -267,6 +334,10 @@ fn candidate_to_entry(c: SearchCandidate) -> Result<MemoryEntry, StewardError> {
         trust_score: c.trust_score,
         created_at: c.created_at,
         embedding,
+        scope: c.scope,
+        source_session: c.source_session,
+        source_channel: c.source_channel,
+        confidence: c.confidence,
     })
 }
 
@@ -279,6 +350,9 @@ fn candidate_to_entry(c: SearchCandidate) -> Result<MemoryEntry, StewardError> {
 /// Combines PostgreSQL full-text search (tsvector/tsquery) with pgvector
 /// cosine similarity search. Results are fused using RRF scoring and
 /// weighted by trust scores to penalize low-trust memories.
+///
+/// Also implements [`MemoryStore`] so that entries written and queried through
+/// the same struct always operate on the unified `memories` table.
 pub struct HybridMemorySearch {
     pool: PgPool,
     config: SearchConfig,
@@ -309,7 +383,8 @@ impl HybridMemorySearch {
     ///
     /// Creates the pgvector extension, the `memories` table, and the FTS and
     /// HNSW indexes. Safe to call on every startup — all statements use
-    /// `IF NOT EXISTS`.
+    /// `IF NOT EXISTS`. Also runs ALTER TABLE migrations to add new columns
+    /// to existing tables.
     pub async fn run_migrations(&self) -> Result<(), StewardError> {
         sqlx::query(EXTENSION_MIGRATION)
             .execute(&self.pool)
@@ -322,6 +397,15 @@ impl HybridMemorySearch {
             .execute(&self.pool)
             .await
             .map_err(|e| StewardError::Database(format!("memories table migration failed: {e}")))?;
+
+        for alter_sql in ALTER_TABLE_MIGRATIONS {
+            sqlx::query(alter_sql)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| {
+                    StewardError::Database(format!("alter table migration failed: {e}"))
+                })?;
+        }
 
         sqlx::query(SEARCH_MIGRATIONS)
             .execute(&self.pool)
@@ -340,31 +424,66 @@ impl HybridMemorySearch {
     /// Perform full-text search using `websearch_to_tsquery`.
     ///
     /// Returns candidates ranked by `ts_rank` score.
+    /// Optionally filters by scope if provided.
     async fn fts_search(
         &self,
         query: &str,
         limit: usize,
+        scope: Option<&str>,
     ) -> Result<Vec<SearchCandidate>, StewardError> {
-        let rows = sqlx::query(
-            r#"
-            SELECT
-                id,
-                content,
-                provenance,
-                trust_score,
-                created_at,
-                embedding::text as embedding_text
-            FROM memories
-            WHERE to_tsvector('english', content) @@ websearch_to_tsquery('english', $1)
-            ORDER BY ts_rank(to_tsvector('english', content), websearch_to_tsquery('english', $1)) DESC
-            LIMIT $2
-            "#,
-        )
-        .bind(query)
-        .bind(limit as i64)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| StewardError::Database(format!("FTS search failed: {e}")))?;
+        let rows = if let Some(scope_val) = scope {
+            sqlx::query(
+                r#"
+                SELECT
+                    id,
+                    content,
+                    provenance,
+                    trust_score,
+                    created_at,
+                    embedding::text as embedding_text,
+                    scope,
+                    source_session,
+                    source_channel,
+                    confidence
+                FROM memories
+                WHERE to_tsvector('english', content) @@ websearch_to_tsquery('english', $1)
+                  AND (scope = $3 OR scope = 'shared')
+                ORDER BY ts_rank(to_tsvector('english', content), websearch_to_tsquery('english', $1)) DESC
+                LIMIT $2
+                "#,
+            )
+            .bind(query)
+            .bind(limit as i64)
+            .bind(scope_val)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StewardError::Database(format!("FTS search failed: {e}")))?
+        } else {
+            sqlx::query(
+                r#"
+                SELECT
+                    id,
+                    content,
+                    provenance,
+                    trust_score,
+                    created_at,
+                    embedding::text as embedding_text,
+                    scope,
+                    source_session,
+                    source_channel,
+                    confidence
+                FROM memories
+                WHERE to_tsvector('english', content) @@ websearch_to_tsquery('english', $1)
+                ORDER BY ts_rank(to_tsvector('english', content), websearch_to_tsquery('english', $1)) DESC
+                LIMIT $2
+                "#,
+            )
+            .bind(query)
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StewardError::Database(format!("FTS search failed: {e}")))?
+        };
 
         rows.iter().map(candidate_from_row).collect()
     }
@@ -372,33 +491,68 @@ impl HybridMemorySearch {
     /// Perform vector similarity search using cosine distance.
     ///
     /// Returns candidates ranked by cosine similarity (highest first).
+    /// Optionally filters by scope if provided.
     async fn vector_search(
         &self,
         embedding: &[f32],
         limit: usize,
+        scope: Option<&str>,
     ) -> Result<Vec<SearchCandidate>, StewardError> {
         let embedding_str = vec_to_pgvector(embedding);
 
-        let rows = sqlx::query(
-            r#"
-            SELECT
-                id,
-                content,
-                provenance,
-                trust_score,
-                created_at,
-                embedding::text as embedding_text
-            FROM memories
-            WHERE embedding IS NOT NULL
-            ORDER BY embedding <=> $1::vector
-            LIMIT $2
-            "#,
-        )
-        .bind(&embedding_str)
-        .bind(limit as i64)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| StewardError::Database(format!("vector search failed: {e}")))?;
+        let rows = if let Some(scope_val) = scope {
+            sqlx::query(
+                r#"
+                SELECT
+                    id,
+                    content,
+                    provenance,
+                    trust_score,
+                    created_at,
+                    embedding::text as embedding_text,
+                    scope,
+                    source_session,
+                    source_channel,
+                    confidence
+                FROM memories
+                WHERE embedding IS NOT NULL
+                  AND (scope = $3 OR scope = 'shared')
+                ORDER BY embedding <=> $1::vector
+                LIMIT $2
+                "#,
+            )
+            .bind(&embedding_str)
+            .bind(limit as i64)
+            .bind(scope_val)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StewardError::Database(format!("vector search failed: {e}")))?
+        } else {
+            sqlx::query(
+                r#"
+                SELECT
+                    id,
+                    content,
+                    provenance,
+                    trust_score,
+                    created_at,
+                    embedding::text as embedding_text,
+                    scope,
+                    source_session,
+                    source_channel,
+                    confidence
+                FROM memories
+                WHERE embedding IS NOT NULL
+                ORDER BY embedding <=> $1::vector
+                LIMIT $2
+                "#,
+            )
+            .bind(&embedding_str)
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StewardError::Database(format!("vector search failed: {e}")))?
+        };
 
         rows.iter().map(candidate_from_row).collect()
     }
@@ -413,15 +567,44 @@ impl HybridMemorySearch {
         query_embedding: Option<&[f32]>,
         limit: usize,
     ) -> Result<Vec<MemorySearchResult>, StewardError> {
+        self.search_scoped(query, query_embedding, limit, None)
+            .await
+    }
+
+    /// Search with an optional scope filter.
+    ///
+    /// If `scope` is `Some`, entries matching that scope **plus** entries with
+    /// `scope = 'shared'` are returned. This ensures shared memories are always
+    /// visible regardless of the requested scope.
+    /// If `scope` is `None`, all entries are searched regardless of scope.
+    pub async fn search_scoped(
+        &self,
+        query: &str,
+        query_embedding: Option<&[f32]>,
+        limit: usize,
+        scope: Option<&str>,
+    ) -> Result<Vec<MemorySearchResult>, StewardError> {
         let effective_limit = limit.min(self.config.candidate_limit);
         let candidate_limit = self.config.candidate_limit;
 
         // Run FTS search
-        let fts_rows = self.fts_search(query, candidate_limit).await?;
+        let fts_rows = self.fts_search(query, candidate_limit, scope).await?;
 
-        // Run vector search if embedding is available
+        // Run vector search if embedding is available; fall back to FTS-only on DB errors
+        // (e.g. dimension mismatch between the query vector and stored embeddings).
         let vector_rows = if let Some(emb) = query_embedding {
-            self.vector_search(emb, candidate_limit).await?
+            match self.vector_search(emb, candidate_limit, scope).await {
+                Ok(rows) => rows,
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        embedding_dims = emb.len(),
+                        query_len = query.len(),
+                        "vector search failed, falling back to FTS-only results"
+                    );
+                    Vec::new()
+                }
+            }
         } else {
             Vec::new()
         };
@@ -499,6 +682,7 @@ impl MemorySearch for HybridMemorySearch {
         &self,
         query: &str,
         limit: usize,
+        scope: Option<&str>,
     ) -> Result<Vec<MemorySearchResult>, StewardError> {
         let embedding = if let Some(provider) = &self.embedding_provider {
             match provider.embed(query).await {
@@ -512,8 +696,118 @@ impl MemorySearch for HybridMemorySearch {
             None
         };
 
-        self.search_with_embedding(query, embedding.as_deref(), limit)
+        self.search_scoped(query, embedding.as_deref(), limit, scope)
             .await
+    }
+}
+
+#[async_trait]
+impl MemoryStore for HybridMemorySearch {
+    async fn store(&self, entry: MemoryEntry) -> Result<MemoryId, StewardError> {
+        validate_trust_score(entry.trust_score, "trust_score")?;
+        if let Some(conf) = entry.confidence {
+            validate_trust_score(conf, "confidence")?;
+        }
+
+        let user_provided_id = entry.id.is_some();
+        let id = entry.id.unwrap_or_else(Uuid::new_v4);
+        let provenance = provenance_to_str(entry.provenance);
+        let embedding_str = entry.embedding.as_deref().map(vec_to_pgvector);
+
+        let result = sqlx::query(
+            r#"
+            INSERT INTO memories
+                (id, content, provenance, trust_score, created_at, embedding,
+                 scope, source_session, source_channel, confidence)
+            VALUES ($1, $2, $3, $4, $5, $6::vector, $7, $8, $9, $10)
+            ON CONFLICT (id) DO NOTHING
+            "#,
+        )
+        .bind(id)
+        .bind(&entry.content)
+        .bind(provenance)
+        .bind(entry.trust_score)
+        .bind(entry.created_at)
+        .bind(embedding_str)
+        .bind(entry.scope.as_deref().unwrap_or("shared"))
+        .bind(entry.source_session)
+        .bind(&entry.source_channel)
+        .bind(entry.confidence)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StewardError::Database(format!("store failed: {e}")))?;
+
+        if result.rows_affected() == 0 && user_provided_id {
+            return Err(StewardError::Memory(format!(
+                "memory entry with id {id} already exists"
+            )));
+        }
+
+        Ok(id)
+    }
+
+    async fn get(&self, id: &MemoryId) -> Result<Option<MemoryEntry>, StewardError> {
+        let row = sqlx::query(
+            r#"
+            SELECT
+                id,
+                content,
+                provenance,
+                trust_score,
+                created_at,
+                embedding::text as embedding_text,
+                scope,
+                source_session,
+                source_channel,
+                confidence
+            FROM memories
+            WHERE id = $1
+            "#,
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| StewardError::Database(e.to_string()))?;
+
+        row.map(|r| candidate_from_row(&r).and_then(candidate_to_entry))
+            .transpose()
+    }
+
+    async fn update_trust(&self, id: &MemoryId, score: f64) -> Result<(), StewardError> {
+        validate_trust_score(score, "new_score")?;
+
+        // Check provenance and current trust score — only user_instruction at trust=1.0 is immutable.
+        let row = sqlx::query("SELECT provenance, trust_score FROM memories WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| StewardError::Database(format!("update_trust query failed: {e}")))?
+            .ok_or_else(|| StewardError::Memory(format!("entry not found: {id}")))?;
+
+        let provenance: String = row
+            .try_get("provenance")
+            .map_err(|e| StewardError::Database(format!("update_trust row parse failed: {e}")))?;
+
+        let current_trust: f64 = row
+            .try_get("trust_score")
+            .map_err(|e| StewardError::Database(format!("update_trust row parse failed: {e}")))?;
+
+        if is_immutable_core_memory(&provenance, current_trust) {
+            return Err(StewardError::Forbidden(
+                "cannot modify trust score of immutable core memory \
+                 (user_instruction with trust_score=1.0)"
+                    .to_string(),
+            ));
+        }
+
+        sqlx::query("UPDATE memories SET trust_score = $1 WHERE id = $2")
+            .bind(score)
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StewardError::Database(format!("update_trust failed: {e}")))?;
+
+        Ok(())
     }
 }
 
@@ -524,6 +818,7 @@ impl MemorySearch for HybridMemorySearch {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
 
     // --------------------------------------------------------
     // Unit tests for RRF computation (no database required)
@@ -550,6 +845,19 @@ mod tests {
         let score = rrf_score_component(60, 100, 1.0);
         let expected = 1.0 / 160.0;
         assert!((score - expected).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_immutable_core_memory_check() {
+        // user_instruction at exactly 1.0 is immutable
+        assert!(is_immutable_core_memory("user_instruction", 1.0));
+        // user_instruction below 1.0 is mutable
+        assert!(!is_immutable_core_memory("user_instruction", 0.8));
+        assert!(!is_immutable_core_memory("user_instruction", 0.0));
+        // Other provenances at 1.0 are mutable
+        assert!(!is_immutable_core_memory("agent_observation", 1.0));
+        assert!(!is_immutable_core_memory("external_content", 1.0));
+        assert!(!is_immutable_core_memory("tool_result", 1.0));
     }
 
     #[test]
@@ -715,6 +1023,45 @@ mod tests {
     }
 
     // --------------------------------------------------------
+    // Unit tests for provenance helpers
+    // --------------------------------------------------------
+
+    #[test]
+    fn test_provenance_to_str_all_variants() {
+        assert_eq!(
+            provenance_to_str(MemoryProvenance::UserInstruction),
+            "user_instruction"
+        );
+        assert_eq!(
+            provenance_to_str(MemoryProvenance::AgentObservation),
+            "agent_observation"
+        );
+        assert_eq!(
+            provenance_to_str(MemoryProvenance::ExternalContent),
+            "external_content"
+        );
+        assert_eq!(
+            provenance_to_str(MemoryProvenance::ToolResult),
+            "tool_result"
+        );
+    }
+
+    #[test]
+    fn test_provenance_roundtrip() {
+        let variants = [
+            MemoryProvenance::UserInstruction,
+            MemoryProvenance::AgentObservation,
+            MemoryProvenance::ExternalContent,
+            MemoryProvenance::ToolResult,
+        ];
+        for v in variants {
+            let s = provenance_to_str(v);
+            let parsed = provenance_from_str(s);
+            assert_eq!(parsed, v);
+        }
+    }
+
+    // --------------------------------------------------------
     // Helper function tests
     // --------------------------------------------------------
 
@@ -777,6 +1124,265 @@ mod tests {
     }
 
     // --------------------------------------------------------
+    // Unit tests for trust_score / confidence validation
+    // --------------------------------------------------------
+
+    #[test]
+    fn test_validate_trust_score_valid() {
+        assert!(validate_trust_score(0.0, "trust_score").is_ok());
+        assert!(validate_trust_score(0.5, "trust_score").is_ok());
+        assert!(validate_trust_score(1.0, "trust_score").is_ok());
+    }
+
+    #[test]
+    fn test_validate_trust_score_nan_rejected() {
+        let err = validate_trust_score(f64::NAN, "trust_score").unwrap_err();
+        assert!(
+            err.to_string().contains("NaN"),
+            "expected NaN error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_trust_score_negative_rejected() {
+        let err = validate_trust_score(-0.1, "trust_score").unwrap_err();
+        assert!(
+            err.to_string().contains("[0.0, 1.0]"),
+            "expected range error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_trust_score_above_one_rejected() {
+        let err = validate_trust_score(1.1, "trust_score").unwrap_err();
+        assert!(
+            err.to_string().contains("[0.0, 1.0]"),
+            "expected range error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_confidence_nan_rejected() {
+        let err = validate_trust_score(f64::NAN, "confidence").unwrap_err();
+        assert!(
+            err.to_string().contains("NaN"),
+            "expected NaN error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_confidence_negative_rejected() {
+        let err = validate_trust_score(-0.5, "confidence").unwrap_err();
+        assert!(
+            err.to_string().contains("[0.0, 1.0]"),
+            "expected range error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_confidence_above_one_rejected() {
+        let err = validate_trust_score(2.0, "confidence").unwrap_err();
+        assert!(
+            err.to_string().contains("[0.0, 1.0]"),
+            "expected range error, got: {err}"
+        );
+    }
+
+    /// Verify that `store()` rejects invalid trust_score values without hitting the DB.
+    #[tokio::test]
+    async fn test_hybrid_store_rejects_nan_trust_score() {
+        // We need a pool but the validation fires before any DB call.
+        // Use a connection to an unlikely-to-exist URL — if the pool creation
+        // itself fails we skip; if it succeeds the validation error fires first.
+        // For a pure-unit path we build a pool lazily (connect-lazy).
+        let pool = PgPool::connect_lazy("postgres://localhost/nonexistent_test_db_steward")
+            .expect("lazy pool should not fail");
+        let search = HybridMemorySearch::new(pool, SearchConfig::default(), None);
+
+        let entry = MemoryEntry {
+            id: None,
+            content: "test".to_string(),
+            provenance: MemoryProvenance::AgentObservation,
+            trust_score: f64::NAN,
+            created_at: chrono::Utc::now(),
+            embedding: None,
+            scope: None,
+            source_session: None,
+            source_channel: None,
+            confidence: None,
+        };
+        let err = search.store(entry).await.unwrap_err();
+        assert!(
+            err.to_string().contains("NaN"),
+            "expected NaN error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_hybrid_store_rejects_negative_trust_score() {
+        let pool = PgPool::connect_lazy("postgres://localhost/nonexistent_test_db_steward")
+            .expect("lazy pool should not fail");
+        let search = HybridMemorySearch::new(pool, SearchConfig::default(), None);
+
+        let entry = MemoryEntry {
+            id: None,
+            content: "test".to_string(),
+            provenance: MemoryProvenance::AgentObservation,
+            trust_score: -0.1,
+            created_at: chrono::Utc::now(),
+            embedding: None,
+            scope: None,
+            source_session: None,
+            source_channel: None,
+            confidence: None,
+        };
+        let err = search.store(entry).await.unwrap_err();
+        assert!(
+            err.to_string().contains("[0.0, 1.0]"),
+            "expected range error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_hybrid_store_rejects_trust_score_above_one() {
+        let pool = PgPool::connect_lazy("postgres://localhost/nonexistent_test_db_steward")
+            .expect("lazy pool should not fail");
+        let search = HybridMemorySearch::new(pool, SearchConfig::default(), None);
+
+        let entry = MemoryEntry {
+            id: None,
+            content: "test".to_string(),
+            provenance: MemoryProvenance::AgentObservation,
+            trust_score: 1.5,
+            created_at: chrono::Utc::now(),
+            embedding: None,
+            scope: None,
+            source_session: None,
+            source_channel: None,
+            confidence: None,
+        };
+        let err = search.store(entry).await.unwrap_err();
+        assert!(
+            err.to_string().contains("[0.0, 1.0]"),
+            "expected range error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_hybrid_store_rejects_nan_confidence() {
+        let pool = PgPool::connect_lazy("postgres://localhost/nonexistent_test_db_steward")
+            .expect("lazy pool should not fail");
+        let search = HybridMemorySearch::new(pool, SearchConfig::default(), None);
+
+        let entry = MemoryEntry {
+            id: None,
+            content: "test".to_string(),
+            provenance: MemoryProvenance::AgentObservation,
+            trust_score: 0.5,
+            created_at: chrono::Utc::now(),
+            embedding: None,
+            scope: None,
+            source_session: None,
+            source_channel: None,
+            confidence: Some(f64::NAN),
+        };
+        let err = search.store(entry).await.unwrap_err();
+        assert!(
+            err.to_string().contains("NaN"),
+            "expected NaN error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_hybrid_store_rejects_negative_confidence() {
+        let pool = PgPool::connect_lazy("postgres://localhost/nonexistent_test_db_steward")
+            .expect("lazy pool should not fail");
+        let search = HybridMemorySearch::new(pool, SearchConfig::default(), None);
+
+        let entry = MemoryEntry {
+            id: None,
+            content: "test".to_string(),
+            provenance: MemoryProvenance::AgentObservation,
+            trust_score: 0.5,
+            created_at: chrono::Utc::now(),
+            embedding: None,
+            scope: None,
+            source_session: None,
+            source_channel: None,
+            confidence: Some(-0.1),
+        };
+        let err = search.store(entry).await.unwrap_err();
+        assert!(
+            err.to_string().contains("[0.0, 1.0]"),
+            "expected range error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_hybrid_store_rejects_confidence_above_one() {
+        let pool = PgPool::connect_lazy("postgres://localhost/nonexistent_test_db_steward")
+            .expect("lazy pool should not fail");
+        let search = HybridMemorySearch::new(pool, SearchConfig::default(), None);
+
+        let entry = MemoryEntry {
+            id: None,
+            content: "test".to_string(),
+            provenance: MemoryProvenance::AgentObservation,
+            trust_score: 0.5,
+            created_at: chrono::Utc::now(),
+            embedding: None,
+            scope: None,
+            source_session: None,
+            source_channel: None,
+            confidence: Some(1.2),
+        };
+        let err = search.store(entry).await.unwrap_err();
+        assert!(
+            err.to_string().contains("[0.0, 1.0]"),
+            "expected range error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_hybrid_update_trust_rejects_nan() {
+        let pool = PgPool::connect_lazy("postgres://localhost/nonexistent_test_db_steward")
+            .expect("lazy pool should not fail");
+        let search = HybridMemorySearch::new(pool, SearchConfig::default(), None);
+        let id = Uuid::new_v4();
+        let err = search.update_trust(&id, f64::NAN).await.unwrap_err();
+        assert!(
+            err.to_string().contains("NaN"),
+            "expected NaN error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_hybrid_update_trust_rejects_negative() {
+        let pool = PgPool::connect_lazy("postgres://localhost/nonexistent_test_db_steward")
+            .expect("lazy pool should not fail");
+        let search = HybridMemorySearch::new(pool, SearchConfig::default(), None);
+        let id = Uuid::new_v4();
+        let err = search.update_trust(&id, -0.5).await.unwrap_err();
+        assert!(
+            err.to_string().contains("[0.0, 1.0]"),
+            "expected range error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_hybrid_update_trust_rejects_above_one() {
+        let pool = PgPool::connect_lazy("postgres://localhost/nonexistent_test_db_steward")
+            .expect("lazy pool should not fail");
+        let search = HybridMemorySearch::new(pool, SearchConfig::default(), None);
+        let id = Uuid::new_v4();
+        let err = search.update_trust(&id, 1.1).await.unwrap_err();
+        assert!(
+            err.to_string().contains("[0.0, 1.0]"),
+            "expected range error, got: {err}"
+        );
+    }
+
+    // --------------------------------------------------------
     // Integration tests (require PostgreSQL + pgvector)
     // --------------------------------------------------------
 
@@ -786,8 +1392,7 @@ mod tests {
         PgPool::connect(&url).await.ok()
     }
 
-    /// SQL to create the memories table for tests.
-    /// In production, this is handled by workspace.rs.
+    /// SQL to create the memories table for tests (3-dim vectors for speed).
     const TEST_TABLE_SQL: &str = "\
 CREATE EXTENSION IF NOT EXISTS vector;\
 \n\
@@ -797,7 +1402,11 @@ CREATE TABLE IF NOT EXISTS memories (\
     provenance TEXT NOT NULL DEFAULT 'agent_observation',\
     trust_score DOUBLE PRECISION NOT NULL DEFAULT 0.5,\
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),\
-    embedding vector(3)\
+    embedding vector(3),\
+    scope TEXT NOT NULL DEFAULT 'shared',\
+    source_session UUID,\
+    source_channel TEXT,\
+    confidence DOUBLE PRECISION\
 );\
 ";
 
@@ -835,6 +1444,107 @@ CREATE TABLE IF NOT EXISTS memories (\
             .execute(pool)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_store_and_search_roundtrip() {
+        let pool = match test_pool().await {
+            Some(p) => p,
+            None => return,
+        };
+        cleanup(&pool).await;
+
+        let search = HybridMemorySearch::new(pool.clone(), SearchConfig::default(), None);
+        search.run_migrations().await.unwrap();
+
+        let entry = MemoryEntry {
+            id: None,
+            content: "Rust is a systems programming language focused on safety".to_string(),
+            provenance: MemoryProvenance::UserInstruction,
+            trust_score: 1.0,
+            created_at: Utc::now(),
+            embedding: None,
+            scope: Some("user".to_string()),
+            source_session: None,
+            source_channel: Some("telegram".to_string()),
+            confidence: Some(0.95),
+        };
+
+        let id = search.store(entry.clone()).await.unwrap();
+
+        let retrieved = search.get(&id).await.unwrap().expect("entry should exist");
+        assert_eq!(retrieved.id, Some(id));
+        assert_eq!(retrieved.content, entry.content);
+        assert_eq!(retrieved.provenance, MemoryProvenance::UserInstruction);
+        assert!((retrieved.trust_score - 1.0).abs() < f64::EPSILON);
+        assert_eq!(retrieved.scope, Some("user".to_string()));
+        assert_eq!(retrieved.source_channel, Some("telegram".to_string()));
+        assert!((retrieved.confidence.unwrap() - 0.95).abs() < f64::EPSILON);
+
+        cleanup(&pool).await;
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_scope_filtering() {
+        let pool = match test_pool().await {
+            Some(p) => p,
+            None => return,
+        };
+        cleanup(&pool).await;
+
+        let search = HybridMemorySearch::new(pool.clone(), SearchConfig::default(), None);
+        search.run_migrations().await.unwrap();
+
+        // Insert entries with different scopes
+        let user_entry = MemoryEntry {
+            id: None,
+            content: "Rust programming is excellent for user-scope work".to_string(),
+            provenance: MemoryProvenance::UserInstruction,
+            trust_score: 1.0,
+            created_at: Utc::now(),
+            embedding: None,
+            scope: Some("user".to_string()),
+            source_session: None,
+            source_channel: None,
+            confidence: None,
+        };
+        let session_entry = MemoryEntry {
+            id: None,
+            content: "Rust programming is excellent for session-scope work".to_string(),
+            provenance: MemoryProvenance::AgentObservation,
+            trust_score: 0.8,
+            created_at: Utc::now(),
+            embedding: None,
+            scope: Some("session".to_string()),
+            source_session: None,
+            source_channel: None,
+            confidence: None,
+        };
+
+        let user_id = search.store(user_entry).await.unwrap();
+        let session_id = search.store(session_entry).await.unwrap();
+
+        // Search with scope=user — should only return user entry
+        let results = search
+            .search_scoped("Rust programming", None, 10, Some("user"))
+            .await
+            .unwrap();
+        let result_ids: Vec<Uuid> = results.iter().filter_map(|r| r.entry.id).collect();
+        assert!(result_ids.contains(&user_id));
+        assert!(!result_ids.contains(&session_id));
+
+        // Search without scope — should return both
+        let results_all = search
+            .search_scoped("Rust programming", None, 10, None)
+            .await
+            .unwrap();
+        let all_ids: Vec<Uuid> = results_all.iter().filter_map(|r| r.entry.id).collect();
+        assert!(all_ids.contains(&user_id));
+        assert!(all_ids.contains(&session_id));
+
+        cleanup(&pool).await;
     }
 
     #[tokio::test]
@@ -882,7 +1592,7 @@ CREATE TABLE IF NOT EXISTS memories (\
         )
         .await;
 
-        let results = search.search("Rust programming", 10).await.unwrap();
+        let results = search.search("Rust programming", 10, None).await.unwrap();
 
         assert!(!results.is_empty());
         // Both Rust-related entries should appear
@@ -1063,7 +1773,7 @@ CREATE TABLE IF NOT EXISTS memories (\
         )
         .await;
 
-        let results = search.search("Rust compiler bugs", 10).await.unwrap();
+        let results = search.search("Rust compiler bugs", 10, None).await.unwrap();
 
         assert!(results.len() >= 2);
 
@@ -1094,7 +1804,7 @@ CREATE TABLE IF NOT EXISTS memories (\
         search.run_migrations().await.unwrap();
 
         // No data inserted — search should return empty
-        let results = search.search("nonexistent query", 10).await.unwrap();
+        let results = search.search("nonexistent query", 10, None).await.unwrap();
         assert!(results.is_empty());
 
         cleanup(&pool).await;
@@ -1121,12 +1831,250 @@ CREATE TABLE IF NOT EXISTS memories (\
         }
 
         // Limit to 2 results
-        let results = search.search("Rust programming safety", 2).await.unwrap();
+        let results = search
+            .search("Rust programming safety", 2, None)
+            .await
+            .unwrap();
         assert!(results.len() <= 2);
 
         // Limit to 10 (should return all 5)
-        let results = search.search("Rust programming safety", 10).await.unwrap();
+        let results = search
+            .search("Rust programming safety", 10, None)
+            .await
+            .unwrap();
         assert_eq!(results.len(), 5);
+
+        cleanup(&pool).await;
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_update_trust_nonexistent() {
+        let pool = match test_pool().await {
+            Some(p) => p,
+            None => return,
+        };
+        cleanup(&pool).await;
+        let search = HybridMemorySearch::new(pool.clone(), SearchConfig::default(), None);
+        search.run_migrations().await.unwrap();
+
+        let result = search.update_trust(&Uuid::new_v4(), 0.5).await;
+        assert!(result.is_err());
+
+        cleanup(&pool).await;
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_update_trust_user_instruction_is_immutable() {
+        let pool = match test_pool().await {
+            Some(p) => p,
+            None => return,
+        };
+        cleanup(&pool).await;
+        let search = HybridMemorySearch::new(pool.clone(), SearchConfig::default(), None);
+        search.run_migrations().await.unwrap();
+
+        // Store a user_instruction memory (immutable core memory).
+        let entry = MemoryEntry {
+            id: None,
+            content: "Always use Rust for systems programming".to_string(),
+            provenance: MemoryProvenance::UserInstruction,
+            trust_score: 1.0,
+            created_at: Utc::now(),
+            embedding: None,
+            scope: None,
+            source_session: None,
+            source_channel: None,
+            confidence: None,
+        };
+        let id = search.store(entry).await.unwrap();
+
+        // Attempting to update trust on a user_instruction memory must be rejected.
+        let result = search.update_trust(&id, 0.3).await;
+        assert!(
+            result.is_err(),
+            "update_trust should fail for user_instruction memory"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("immutable core memory"),
+            "error message should mention immutable core memory, got: {err_msg}"
+        );
+
+        cleanup(&pool).await;
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_update_trust_user_instruction_mutable_at_low_trust() {
+        let pool = match test_pool().await {
+            Some(p) => p,
+            None => return,
+        };
+        cleanup(&pool).await;
+        let search = HybridMemorySearch::new(pool.clone(), SearchConfig::default(), None);
+        search.run_migrations().await.unwrap();
+
+        // Store a user_instruction memory with trust_score < 1.0 (mutable).
+        let entry = MemoryEntry {
+            id: None,
+            content: "Draft instruction with sub-max trust".to_string(),
+            provenance: MemoryProvenance::UserInstruction,
+            trust_score: 0.8,
+            created_at: Utc::now(),
+            embedding: None,
+            scope: None,
+            source_session: None,
+            source_channel: None,
+            confidence: None,
+        };
+        let id = search.store(entry).await.unwrap();
+
+        // Should succeed because trust_score != 1.0
+        search
+            .update_trust(&id, 0.9)
+            .await
+            .expect("update_trust should succeed for user_instruction with trust < 1.0");
+
+        let updated = search.get(&id).await.unwrap().expect("entry should exist");
+        assert!(
+            (updated.trust_score - 0.9).abs() < f64::EPSILON,
+            "trust_score should have been updated to 0.9"
+        );
+
+        cleanup(&pool).await;
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_store_duplicate_id_returns_error() {
+        let pool = match test_pool().await {
+            Some(p) => p,
+            None => return,
+        };
+        cleanup(&pool).await;
+        let search = HybridMemorySearch::new(pool.clone(), SearchConfig::default(), None);
+        search.run_migrations().await.unwrap();
+
+        let fixed_id = Uuid::new_v4();
+
+        // First store with explicit ID succeeds.
+        let first = MemoryEntry {
+            id: Some(fixed_id),
+            content: "First entry with fixed ID".to_string(),
+            provenance: MemoryProvenance::AgentObservation,
+            trust_score: 0.8,
+            created_at: Utc::now(),
+            embedding: None,
+            scope: None,
+            source_session: None,
+            source_channel: None,
+            confidence: None,
+        };
+        let returned_id = search.store(first).await.unwrap();
+        assert_eq!(returned_id, fixed_id);
+
+        // Second store with the same explicit ID must return an error.
+        let duplicate = MemoryEntry {
+            id: Some(fixed_id),
+            content: "Duplicate entry with the same ID".to_string(),
+            provenance: MemoryProvenance::AgentObservation,
+            trust_score: 0.5,
+            created_at: Utc::now(),
+            embedding: None,
+            scope: None,
+            source_session: None,
+            source_channel: None,
+            confidence: None,
+        };
+        let result = search.store(duplicate).await;
+        assert!(
+            result.is_err(),
+            "store with duplicate ID should return error"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("already exists"),
+            "error message should mention already exists, got: {err_msg}"
+        );
+
+        cleanup(&pool).await;
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_scoped_search_includes_shared() {
+        let pool = match test_pool().await {
+            Some(p) => p,
+            None => return,
+        };
+        cleanup(&pool).await;
+
+        let search = HybridMemorySearch::new(pool.clone(), SearchConfig::default(), None);
+        search.run_migrations().await.unwrap();
+
+        // Insert a shared entry and a session-scoped entry
+        let shared_entry = MemoryEntry {
+            id: None,
+            content: "Rust programming shared knowledge for everyone".to_string(),
+            provenance: MemoryProvenance::UserInstruction,
+            trust_score: 1.0,
+            created_at: Utc::now(),
+            embedding: None,
+            scope: Some("shared".to_string()),
+            source_session: None,
+            source_channel: None,
+            confidence: None,
+        };
+        let session_entry = MemoryEntry {
+            id: None,
+            content: "Rust programming session-specific context".to_string(),
+            provenance: MemoryProvenance::AgentObservation,
+            trust_score: 0.8,
+            created_at: Utc::now(),
+            embedding: None,
+            scope: Some("session_abc".to_string()),
+            source_session: None,
+            source_channel: None,
+            confidence: None,
+        };
+        let other_session_entry = MemoryEntry {
+            id: None,
+            content: "Rust programming from another session entirely".to_string(),
+            provenance: MemoryProvenance::AgentObservation,
+            trust_score: 0.8,
+            created_at: Utc::now(),
+            embedding: None,
+            scope: Some("session_xyz".to_string()),
+            source_session: None,
+            source_channel: None,
+            confidence: None,
+        };
+
+        let shared_id = search.store(shared_entry).await.unwrap();
+        let session_id = search.store(session_entry).await.unwrap();
+        let other_id = search.store(other_session_entry).await.unwrap();
+
+        // Searching with scope=session_abc should return session_abc + shared, but NOT session_xyz
+        let results = search
+            .search("Rust programming", 10, Some("session_abc"))
+            .await
+            .unwrap();
+        let result_ids: Vec<Uuid> = results.iter().filter_map(|r| r.entry.id).collect();
+
+        assert!(
+            result_ids.contains(&shared_id),
+            "scoped search should include shared entries"
+        );
+        assert!(
+            result_ids.contains(&session_id),
+            "scoped search should include matching scope entries"
+        );
+        assert!(
+            !result_ids.contains(&other_id),
+            "scoped search should exclude entries from other scopes"
+        );
 
         cleanup(&pool).await;
     }
