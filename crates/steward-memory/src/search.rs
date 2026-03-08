@@ -239,6 +239,14 @@ pub(crate) fn provenance_to_str(p: MemoryProvenance) -> &'static str {
     }
 }
 
+/// Check if a memory entry is in the immutable core memory tier.
+///
+/// Only entries with provenance `user_instruction` **and** `trust_score == 1.0` are
+/// considered immutable. A `user_instruction` entry below max trust is still mutable.
+fn is_immutable_core_memory(provenance: &str, trust_score: f64) -> bool {
+    provenance == "user_instruction" && (trust_score - 1.0).abs() < f64::EPSILON
+}
+
 // ============================================================
 // Database Row Extraction
 // ============================================================
@@ -727,8 +735,8 @@ impl MemoryStore for HybridMemorySearch {
     }
 
     async fn update_trust(&self, id: &MemoryId, score: f64) -> Result<(), StewardError> {
-        // Check provenance first — user_instruction memories are immutable.
-        let row = sqlx::query("SELECT provenance FROM memories WHERE id = $1")
+        // Check provenance and current trust score — only user_instruction at trust=1.0 is immutable.
+        let row = sqlx::query("SELECT provenance, trust_score FROM memories WHERE id = $1")
             .bind(id)
             .fetch_optional(&self.pool)
             .await
@@ -739,9 +747,15 @@ impl MemoryStore for HybridMemorySearch {
             .try_get("provenance")
             .map_err(|e| StewardError::Database(format!("update_trust row parse failed: {e}")))?;
 
-        if provenance == "user_instruction" {
-            return Err(StewardError::Memory(
-                "cannot modify trust score of immutable core memory".to_string(),
+        let current_trust: f64 = row
+            .try_get("trust_score")
+            .map_err(|e| StewardError::Database(format!("update_trust row parse failed: {e}")))?;
+
+        if is_immutable_core_memory(&provenance, current_trust) {
+            return Err(StewardError::Forbidden(
+                "cannot modify trust score of immutable core memory \
+                 (user_instruction with trust_score=1.0)"
+                    .to_string(),
             ));
         }
 
@@ -790,6 +804,19 @@ mod tests {
         let score = rrf_score_component(60, 100, 1.0);
         let expected = 1.0 / 160.0;
         assert!((score - expected).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_immutable_core_memory_check() {
+        // user_instruction at exactly 1.0 is immutable
+        assert!(is_immutable_core_memory("user_instruction", 1.0));
+        // user_instruction below 1.0 is mutable
+        assert!(!is_immutable_core_memory("user_instruction", 0.8));
+        assert!(!is_immutable_core_memory("user_instruction", 0.0));
+        // Other provenances at 1.0 are mutable
+        assert!(!is_immutable_core_memory("agent_observation", 1.0));
+        assert!(!is_immutable_core_memory("external_content", 1.0));
+        assert!(!is_immutable_core_memory("tool_result", 1.0));
     }
 
     #[test]
@@ -1567,6 +1594,47 @@ CREATE TABLE IF NOT EXISTS memories (\
         assert!(
             err_msg.contains("immutable core memory"),
             "error message should mention immutable core memory, got: {err_msg}"
+        );
+
+        cleanup(&pool).await;
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_update_trust_user_instruction_mutable_at_low_trust() {
+        let pool = match test_pool().await {
+            Some(p) => p,
+            None => return,
+        };
+        cleanup(&pool).await;
+        let search = HybridMemorySearch::new(pool.clone(), SearchConfig::default(), None);
+        search.run_migrations().await.unwrap();
+
+        // Store a user_instruction memory with trust_score < 1.0 (mutable).
+        let entry = MemoryEntry {
+            id: None,
+            content: "Draft instruction with sub-max trust".to_string(),
+            provenance: MemoryProvenance::UserInstruction,
+            trust_score: 0.8,
+            created_at: Utc::now(),
+            embedding: None,
+            scope: None,
+            source_session: None,
+            source_channel: None,
+            confidence: None,
+        };
+        let id = search.store(entry).await.unwrap();
+
+        // Should succeed because trust_score != 1.0
+        search
+            .update_trust(&id, 0.9)
+            .await
+            .expect("update_trust should succeed for user_instruction with trust < 1.0");
+
+        let updated = search.get(&id).await.unwrap().expect("entry should exist");
+        assert!(
+            (updated.trust_score - 0.9).abs() < f64::EPSILON,
+            "trust_score should have been updated to 0.9"
         );
 
         cleanup(&pool).await;
