@@ -239,6 +239,21 @@ pub(crate) fn provenance_to_str(p: MemoryProvenance) -> &'static str {
     }
 }
 
+/// Validate that a score field is finite and within [0.0, 1.0].
+///
+/// Returns `StewardError::Memory` for NaN or out-of-range values.
+fn validate_trust_score(score: f64, field: &str) -> Result<(), StewardError> {
+    if score.is_nan() {
+        return Err(StewardError::Memory(format!("{field} must not be NaN")));
+    }
+    if !(0.0..=1.0).contains(&score) {
+        return Err(StewardError::Memory(format!(
+            "{field} must be in [0.0, 1.0], got {score}"
+        )));
+    }
+    Ok(())
+}
+
 /// Check if a memory entry is in the immutable core memory tier.
 ///
 /// Only entries with provenance `user_instruction` **and** `trust_score == 1.0` are
@@ -670,6 +685,11 @@ impl MemorySearch for HybridMemorySearch {
 #[async_trait]
 impl MemoryStore for HybridMemorySearch {
     async fn store(&self, entry: MemoryEntry) -> Result<MemoryId, StewardError> {
+        validate_trust_score(entry.trust_score, "trust_score")?;
+        if let Some(conf) = entry.confidence {
+            validate_trust_score(conf, "confidence")?;
+        }
+
         let user_provided_id = entry.id.is_some();
         let id = entry.id.unwrap_or_else(Uuid::new_v4);
         let provenance = provenance_to_str(entry.provenance);
@@ -735,6 +755,8 @@ impl MemoryStore for HybridMemorySearch {
     }
 
     async fn update_trust(&self, id: &MemoryId, score: f64) -> Result<(), StewardError> {
+        validate_trust_score(score, "new_score")?;
+
         // Check provenance and current trust score — only user_instruction at trust=1.0 is immutable.
         let row = sqlx::query("SELECT provenance, trust_score FROM memories WHERE id = $1")
             .bind(id)
@@ -1080,6 +1102,265 @@ mod tests {
     fn test_provenance_from_str_unknown_defaults() {
         let result = provenance_from_str("unknown_value");
         assert_eq!(result, MemoryProvenance::AgentObservation);
+    }
+
+    // --------------------------------------------------------
+    // Unit tests for trust_score / confidence validation
+    // --------------------------------------------------------
+
+    #[test]
+    fn test_validate_trust_score_valid() {
+        assert!(validate_trust_score(0.0, "trust_score").is_ok());
+        assert!(validate_trust_score(0.5, "trust_score").is_ok());
+        assert!(validate_trust_score(1.0, "trust_score").is_ok());
+    }
+
+    #[test]
+    fn test_validate_trust_score_nan_rejected() {
+        let err = validate_trust_score(f64::NAN, "trust_score").unwrap_err();
+        assert!(
+            err.to_string().contains("NaN"),
+            "expected NaN error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_trust_score_negative_rejected() {
+        let err = validate_trust_score(-0.1, "trust_score").unwrap_err();
+        assert!(
+            err.to_string().contains("[0.0, 1.0]"),
+            "expected range error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_trust_score_above_one_rejected() {
+        let err = validate_trust_score(1.1, "trust_score").unwrap_err();
+        assert!(
+            err.to_string().contains("[0.0, 1.0]"),
+            "expected range error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_confidence_nan_rejected() {
+        let err = validate_trust_score(f64::NAN, "confidence").unwrap_err();
+        assert!(
+            err.to_string().contains("NaN"),
+            "expected NaN error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_confidence_negative_rejected() {
+        let err = validate_trust_score(-0.5, "confidence").unwrap_err();
+        assert!(
+            err.to_string().contains("[0.0, 1.0]"),
+            "expected range error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_confidence_above_one_rejected() {
+        let err = validate_trust_score(2.0, "confidence").unwrap_err();
+        assert!(
+            err.to_string().contains("[0.0, 1.0]"),
+            "expected range error, got: {err}"
+        );
+    }
+
+    /// Verify that `store()` rejects invalid trust_score values without hitting the DB.
+    #[tokio::test]
+    async fn test_hybrid_store_rejects_nan_trust_score() {
+        // We need a pool but the validation fires before any DB call.
+        // Use a connection to an unlikely-to-exist URL — if the pool creation
+        // itself fails we skip; if it succeeds the validation error fires first.
+        // For a pure-unit path we build a pool lazily (connect-lazy).
+        let pool = PgPool::connect_lazy("postgres://localhost/nonexistent_test_db_steward")
+            .expect("lazy pool should not fail");
+        let search = HybridMemorySearch::new(pool, SearchConfig::default(), None);
+
+        let entry = MemoryEntry {
+            id: None,
+            content: "test".to_string(),
+            provenance: MemoryProvenance::AgentObservation,
+            trust_score: f64::NAN,
+            created_at: chrono::Utc::now(),
+            embedding: None,
+            scope: None,
+            source_session: None,
+            source_channel: None,
+            confidence: None,
+        };
+        let err = search.store(entry).await.unwrap_err();
+        assert!(
+            err.to_string().contains("NaN"),
+            "expected NaN error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_hybrid_store_rejects_negative_trust_score() {
+        let pool = PgPool::connect_lazy("postgres://localhost/nonexistent_test_db_steward")
+            .expect("lazy pool should not fail");
+        let search = HybridMemorySearch::new(pool, SearchConfig::default(), None);
+
+        let entry = MemoryEntry {
+            id: None,
+            content: "test".to_string(),
+            provenance: MemoryProvenance::AgentObservation,
+            trust_score: -0.1,
+            created_at: chrono::Utc::now(),
+            embedding: None,
+            scope: None,
+            source_session: None,
+            source_channel: None,
+            confidence: None,
+        };
+        let err = search.store(entry).await.unwrap_err();
+        assert!(
+            err.to_string().contains("[0.0, 1.0]"),
+            "expected range error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_hybrid_store_rejects_trust_score_above_one() {
+        let pool = PgPool::connect_lazy("postgres://localhost/nonexistent_test_db_steward")
+            .expect("lazy pool should not fail");
+        let search = HybridMemorySearch::new(pool, SearchConfig::default(), None);
+
+        let entry = MemoryEntry {
+            id: None,
+            content: "test".to_string(),
+            provenance: MemoryProvenance::AgentObservation,
+            trust_score: 1.5,
+            created_at: chrono::Utc::now(),
+            embedding: None,
+            scope: None,
+            source_session: None,
+            source_channel: None,
+            confidence: None,
+        };
+        let err = search.store(entry).await.unwrap_err();
+        assert!(
+            err.to_string().contains("[0.0, 1.0]"),
+            "expected range error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_hybrid_store_rejects_nan_confidence() {
+        let pool = PgPool::connect_lazy("postgres://localhost/nonexistent_test_db_steward")
+            .expect("lazy pool should not fail");
+        let search = HybridMemorySearch::new(pool, SearchConfig::default(), None);
+
+        let entry = MemoryEntry {
+            id: None,
+            content: "test".to_string(),
+            provenance: MemoryProvenance::AgentObservation,
+            trust_score: 0.5,
+            created_at: chrono::Utc::now(),
+            embedding: None,
+            scope: None,
+            source_session: None,
+            source_channel: None,
+            confidence: Some(f64::NAN),
+        };
+        let err = search.store(entry).await.unwrap_err();
+        assert!(
+            err.to_string().contains("NaN"),
+            "expected NaN error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_hybrid_store_rejects_negative_confidence() {
+        let pool = PgPool::connect_lazy("postgres://localhost/nonexistent_test_db_steward")
+            .expect("lazy pool should not fail");
+        let search = HybridMemorySearch::new(pool, SearchConfig::default(), None);
+
+        let entry = MemoryEntry {
+            id: None,
+            content: "test".to_string(),
+            provenance: MemoryProvenance::AgentObservation,
+            trust_score: 0.5,
+            created_at: chrono::Utc::now(),
+            embedding: None,
+            scope: None,
+            source_session: None,
+            source_channel: None,
+            confidence: Some(-0.1),
+        };
+        let err = search.store(entry).await.unwrap_err();
+        assert!(
+            err.to_string().contains("[0.0, 1.0]"),
+            "expected range error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_hybrid_store_rejects_confidence_above_one() {
+        let pool = PgPool::connect_lazy("postgres://localhost/nonexistent_test_db_steward")
+            .expect("lazy pool should not fail");
+        let search = HybridMemorySearch::new(pool, SearchConfig::default(), None);
+
+        let entry = MemoryEntry {
+            id: None,
+            content: "test".to_string(),
+            provenance: MemoryProvenance::AgentObservation,
+            trust_score: 0.5,
+            created_at: chrono::Utc::now(),
+            embedding: None,
+            scope: None,
+            source_session: None,
+            source_channel: None,
+            confidence: Some(1.2),
+        };
+        let err = search.store(entry).await.unwrap_err();
+        assert!(
+            err.to_string().contains("[0.0, 1.0]"),
+            "expected range error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_hybrid_update_trust_rejects_nan() {
+        let pool = PgPool::connect_lazy("postgres://localhost/nonexistent_test_db_steward")
+            .expect("lazy pool should not fail");
+        let search = HybridMemorySearch::new(pool, SearchConfig::default(), None);
+        let id = Uuid::new_v4();
+        let err = search.update_trust(&id, f64::NAN).await.unwrap_err();
+        assert!(
+            err.to_string().contains("NaN"),
+            "expected NaN error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_hybrid_update_trust_rejects_negative() {
+        let pool = PgPool::connect_lazy("postgres://localhost/nonexistent_test_db_steward")
+            .expect("lazy pool should not fail");
+        let search = HybridMemorySearch::new(pool, SearchConfig::default(), None);
+        let id = Uuid::new_v4();
+        let err = search.update_trust(&id, -0.5).await.unwrap_err();
+        assert!(
+            err.to_string().contains("[0.0, 1.0]"),
+            "expected range error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_hybrid_update_trust_rejects_above_one() {
+        let pool = PgPool::connect_lazy("postgres://localhost/nonexistent_test_db_steward")
+            .expect("lazy pool should not fail");
+        let search = HybridMemorySearch::new(pool, SearchConfig::default(), None);
+        let id = Uuid::new_v4();
+        let err = search.update_trust(&id, 1.1).await.unwrap_err();
+        assert!(
+            err.to_string().contains("[0.0, 1.0]"),
+            "expected range error, got: {err}"
+        );
     }
 
     // --------------------------------------------------------

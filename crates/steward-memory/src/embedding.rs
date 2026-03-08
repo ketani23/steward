@@ -49,17 +49,22 @@ impl OpenAiEmbeddingProvider {
     /// Uses `text-embedding-3-small` by default (1536 dimensions).
     /// The underlying HTTP client is configured with a 5-second connect timeout
     /// and a 10-second per-request timeout.
-    pub fn new(api_key: String) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns `StewardError::Config` if the HTTP client cannot be constructed
+    /// (e.g. TLS initialisation failure).
+    pub fn new(api_key: String) -> Result<Self, StewardError> {
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(5))
             .timeout(Duration::from_secs(10))
             .build()
-            .expect("failed to build reqwest client");
-        Self {
+            .map_err(|e| StewardError::Config(format!("failed to build reqwest client: {e}")))?;
+        Ok(Self {
             api_key,
             model: "text-embedding-3-small".to_string(),
             client,
-        }
+        })
     }
 
     /// Create a provider with a custom model name and pre-built HTTP client.
@@ -138,7 +143,7 @@ mod tests {
 
     #[test]
     fn test_new_uses_default_model() {
-        let provider = OpenAiEmbeddingProvider::new("sk-test".to_string());
+        let provider = OpenAiEmbeddingProvider::new("sk-test".to_string()).unwrap();
         assert_eq!(provider.model, "text-embedding-3-small");
         assert_eq!(provider.api_key, "sk-test");
     }
@@ -197,7 +202,7 @@ mod tests {
             Ok(k) => k,
             Err(_) => return,
         };
-        let provider = OpenAiEmbeddingProvider::new(api_key);
+        let provider = OpenAiEmbeddingProvider::new(api_key).unwrap();
         let result = provider.embed("Hello world").await.unwrap();
         assert_eq!(result.len(), 1536);
     }
