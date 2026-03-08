@@ -15,6 +15,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use sqlx::{PgPool, Row};
+use tracing::warn;
 use uuid::Uuid;
 
 use steward_types::actions::{MemoryEntry, MemoryId, MemoryProvenance, MemorySearchResult};
@@ -39,7 +40,7 @@ CREATE TABLE IF NOT EXISTS memories (\
     trust_score DOUBLE PRECISION NOT NULL DEFAULT 0.5, \
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), \
     embedding vector(1536), \
-    scope TEXT, \
+    scope TEXT NOT NULL DEFAULT 'shared', \
     source_session UUID, \
     source_channel TEXT, \
     confidence DOUBLE PRECISION\
@@ -49,10 +50,14 @@ CREATE TABLE IF NOT EXISTS memories (\
 ///
 /// Safe to run multiple times — `ADD COLUMN IF NOT EXISTS` is idempotent.
 const ALTER_TABLE_MIGRATIONS: &[&str] = &[
-    "ALTER TABLE memories ADD COLUMN IF NOT EXISTS scope TEXT",
+    "ALTER TABLE memories ADD COLUMN IF NOT EXISTS scope TEXT NOT NULL DEFAULT 'shared'",
     "ALTER TABLE memories ADD COLUMN IF NOT EXISTS source_session UUID",
     "ALTER TABLE memories ADD COLUMN IF NOT EXISTS source_channel TEXT",
     "ALTER TABLE memories ADD COLUMN IF NOT EXISTS confidence DOUBLE PRECISION",
+    // Backfill: ensure any pre-existing NULL scope values are set and column is NOT NULL.
+    "UPDATE memories SET scope = 'shared' WHERE scope IS NULL",
+    "ALTER TABLE memories ALTER COLUMN scope SET NOT NULL",
+    "ALTER TABLE memories ALTER COLUMN scope SET DEFAULT 'shared'",
 ];
 
 /// SQL migrations for the search module.
@@ -584,9 +589,16 @@ impl HybridMemorySearch {
         // Run FTS search
         let fts_rows = self.fts_search(query, candidate_limit, scope).await?;
 
-        // Run vector search if embedding is available
+        // Run vector search if embedding is available; fall back to FTS-only on DB errors
+        // (e.g. dimension mismatch between the query vector and stored embeddings).
         let vector_rows = if let Some(emb) = query_embedding {
-            self.vector_search(emb, candidate_limit, scope).await?
+            match self.vector_search(emb, candidate_limit, scope).await {
+                Ok(rows) => rows,
+                Err(e) => {
+                    warn!("vector search failed, falling back to FTS-only results: {e}");
+                    Vec::new()
+                }
+            }
         } else {
             Vec::new()
         };
@@ -710,7 +722,7 @@ impl MemoryStore for HybridMemorySearch {
         .bind(entry.trust_score)
         .bind(entry.created_at)
         .bind(embedding_str)
-        .bind(&entry.scope)
+        .bind(entry.scope.as_deref().unwrap_or("shared"))
         .bind(entry.source_session)
         .bind(&entry.source_channel)
         .bind(entry.confidence)
@@ -1384,7 +1396,7 @@ CREATE TABLE IF NOT EXISTS memories (\
     trust_score DOUBLE PRECISION NOT NULL DEFAULT 0.5,\
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),\
     embedding vector(3),\
-    scope TEXT,\
+    scope TEXT NOT NULL DEFAULT 'shared',\
     source_session UUID,\
     source_channel TEXT,\
     confidence DOUBLE PRECISION\

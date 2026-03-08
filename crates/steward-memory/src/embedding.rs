@@ -119,12 +119,21 @@ impl EmbeddingProvider for OpenAiEmbeddingProvider {
             StewardError::Memory(format!("failed to parse embedding response: {e}"))
         })?;
 
-        parsed
+        let embedding = parsed
             .data
             .into_iter()
             .next()
             .map(|d| d.embedding)
-            .ok_or_else(|| StewardError::Memory("empty embedding response".to_string()))
+            .ok_or_else(|| StewardError::Memory("empty embedding response".to_string()))?;
+
+        if embedding.len() != 1536 {
+            return Err(StewardError::Memory(format!(
+                "embedding dimension mismatch: expected 1536, got {}",
+                embedding.len()
+            )));
+        }
+
+        Ok(embedding)
     }
 }
 
