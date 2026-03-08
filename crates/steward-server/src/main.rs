@@ -776,6 +776,7 @@ impl steward_types::traits::MemorySearch for NullMemorySearch {
         &self,
         _query: &str,
         _limit: usize,
+        _scope: Option<&str>,
     ) -> Result<Vec<steward_types::actions::MemorySearchResult>, steward_types::errors::StewardError>
     {
         Ok(vec![])
