@@ -662,11 +662,12 @@ impl MemorySearch for HybridMemorySearch {
 #[async_trait]
 impl MemoryStore for HybridMemorySearch {
     async fn store(&self, entry: MemoryEntry) -> Result<MemoryId, StewardError> {
+        let user_provided_id = entry.id.is_some();
         let id = entry.id.unwrap_or_else(Uuid::new_v4);
         let provenance = provenance_to_str(entry.provenance);
         let embedding_str = entry.embedding.as_deref().map(vec_to_pgvector);
 
-        sqlx::query(
+        let result = sqlx::query(
             r#"
             INSERT INTO memories
                 (id, content, provenance, trust_score, created_at, embedding,
@@ -688,6 +689,12 @@ impl MemoryStore for HybridMemorySearch {
         .execute(&self.pool)
         .await
         .map_err(|e| StewardError::Database(format!("store failed: {e}")))?;
+
+        if result.rows_affected() == 0 && user_provided_id {
+            return Err(StewardError::Memory(format!(
+                "memory entry with id {id} already exists"
+            )));
+        }
 
         Ok(id)
     }
@@ -720,17 +727,30 @@ impl MemoryStore for HybridMemorySearch {
     }
 
     async fn update_trust(&self, id: &MemoryId, score: f64) -> Result<(), StewardError> {
-        let rows_affected = sqlx::query("UPDATE memories SET trust_score = $1 WHERE id = $2")
+        // Check provenance first — user_instruction memories are immutable.
+        let row = sqlx::query("SELECT provenance FROM memories WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| StewardError::Database(format!("update_trust query failed: {e}")))?
+            .ok_or_else(|| StewardError::Memory(format!("entry not found: {id}")))?;
+
+        let provenance: String = row
+            .try_get("provenance")
+            .map_err(|e| StewardError::Database(format!("update_trust row parse failed: {e}")))?;
+
+        if provenance == "user_instruction" {
+            return Err(StewardError::Memory(
+                "cannot modify trust score of immutable core memory".to_string(),
+            ));
+        }
+
+        sqlx::query("UPDATE memories SET trust_score = $1 WHERE id = $2")
             .bind(score)
             .bind(id)
             .execute(&self.pool)
             .await
-            .map_err(|e| StewardError::Database(format!("update_trust failed: {e}")))?
-            .rows_affected();
-
-        if rows_affected == 0 {
-            return Err(StewardError::Memory(format!("entry not found: {id}")));
-        }
+            .map_err(|e| StewardError::Database(format!("update_trust failed: {e}")))?;
 
         Ok(())
     }
@@ -1507,6 +1527,103 @@ CREATE TABLE IF NOT EXISTS memories (\
 
         let result = search.update_trust(&Uuid::new_v4(), 0.5).await;
         assert!(result.is_err());
+
+        cleanup(&pool).await;
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_update_trust_user_instruction_is_immutable() {
+        let pool = match test_pool().await {
+            Some(p) => p,
+            None => return,
+        };
+        cleanup(&pool).await;
+        let search = HybridMemorySearch::new(pool.clone(), SearchConfig::default(), None);
+        search.run_migrations().await.unwrap();
+
+        // Store a user_instruction memory (immutable core memory).
+        let entry = MemoryEntry {
+            id: None,
+            content: "Always use Rust for systems programming".to_string(),
+            provenance: MemoryProvenance::UserInstruction,
+            trust_score: 1.0,
+            created_at: Utc::now(),
+            embedding: None,
+            scope: None,
+            source_session: None,
+            source_channel: None,
+            confidence: None,
+        };
+        let id = search.store(entry).await.unwrap();
+
+        // Attempting to update trust on a user_instruction memory must be rejected.
+        let result = search.update_trust(&id, 0.3).await;
+        assert!(
+            result.is_err(),
+            "update_trust should fail for user_instruction memory"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("immutable core memory"),
+            "error message should mention immutable core memory, got: {err_msg}"
+        );
+
+        cleanup(&pool).await;
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_store_duplicate_id_returns_error() {
+        let pool = match test_pool().await {
+            Some(p) => p,
+            None => return,
+        };
+        cleanup(&pool).await;
+        let search = HybridMemorySearch::new(pool.clone(), SearchConfig::default(), None);
+        search.run_migrations().await.unwrap();
+
+        let fixed_id = Uuid::new_v4();
+
+        // First store with explicit ID succeeds.
+        let first = MemoryEntry {
+            id: Some(fixed_id),
+            content: "First entry with fixed ID".to_string(),
+            provenance: MemoryProvenance::AgentObservation,
+            trust_score: 0.8,
+            created_at: Utc::now(),
+            embedding: None,
+            scope: None,
+            source_session: None,
+            source_channel: None,
+            confidence: None,
+        };
+        let returned_id = search.store(first).await.unwrap();
+        assert_eq!(returned_id, fixed_id);
+
+        // Second store with the same explicit ID must return an error.
+        let duplicate = MemoryEntry {
+            id: Some(fixed_id),
+            content: "Duplicate entry with the same ID".to_string(),
+            provenance: MemoryProvenance::AgentObservation,
+            trust_score: 0.5,
+            created_at: Utc::now(),
+            embedding: None,
+            scope: None,
+            source_session: None,
+            source_channel: None,
+            confidence: None,
+        };
+        let result = search.store(duplicate).await;
+        assert!(
+            result.is_err(),
+            "store with duplicate ID should return error"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("already exists"),
+            "error message should mention already exists, got: {err_msg}"
+        );
 
         cleanup(&pool).await;
     }
