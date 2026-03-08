@@ -4,6 +4,8 @@
 //! (`text-embedding-3-small`, 1536 dimensions) to generate vector embeddings
 //! for memory search.
 
+use std::time::Duration;
+
 use async_trait::async_trait;
 use serde::Deserialize;
 
@@ -45,11 +47,18 @@ impl OpenAiEmbeddingProvider {
     /// Create a new provider with the given API key.
     ///
     /// Uses `text-embedding-3-small` by default (1536 dimensions).
+    /// The underlying HTTP client is configured with a 5-second connect timeout
+    /// and a 10-second per-request timeout.
     pub fn new(api_key: String) -> Self {
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(10))
+            .build()
+            .expect("failed to build reqwest client");
         Self {
             api_key,
             model: "text-embedding-3-small".to_string(),
-            client: reqwest::Client::new(),
+            client,
         }
     }
 
@@ -85,12 +94,19 @@ impl EmbeddingProvider for OpenAiEmbeddingProvider {
 
         if !response.status().is_success() {
             let status = response.status();
-            let text = response
+            let raw = response
                 .text()
                 .await
                 .unwrap_or_else(|_| "<unreadable>".to_string());
+            // Truncate to 200 chars and strip non-printable bytes to avoid
+            // leaking large upstream error bodies into log sinks.
+            let truncated: String = raw
+                .chars()
+                .filter(|c| !c.is_control() || *c == ' ')
+                .take(200)
+                .collect();
             return Err(StewardError::Memory(format!(
-                "embedding API returned {status}: {text}"
+                "embedding API returned {status}: {truncated}"
             )));
         }
 
