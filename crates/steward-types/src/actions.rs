@@ -360,6 +360,14 @@ pub struct MemoryEntry {
     pub created_at: DateTime<Utc>,
     /// Vector embedding for similarity search (None if not yet computed).
     pub embedding: Option<Vec<f32>>,
+    /// Optional scope for this memory (e.g., "session", "user", "global").
+    pub scope: Option<String>,
+    /// Session identifier this memory originated from.
+    pub source_session: Option<Uuid>,
+    /// Channel this memory originated from (e.g., "telegram", "whatsapp").
+    pub source_channel: Option<String>,
+    /// Confidence score for this memory (0.0 to 1.0).
+    pub confidence: Option<f64>,
 }
 
 /// How a memory entry was created.

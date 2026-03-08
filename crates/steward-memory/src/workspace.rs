@@ -64,6 +64,14 @@ ON memory_entries (trust_score)";
 /// - Trust score management with immutable core memory protection
 /// - Vector embedding storage via the pgvector extension
 /// - Bulk retrieval by provenance via [`get_by_provenance`](Self::get_by_provenance)
+///
+/// # Deprecation Notice
+///
+/// Prefer [`HybridMemorySearch`](crate::search::HybridMemorySearch) which implements
+/// both [`MemoryStore`] and [`MemorySearch`](steward_types::traits::MemorySearch) on the
+/// unified `memories` table. `PgMemoryStore` operates on a separate `memory_entries` table
+/// and will be removed in a future release.
+// TODO(deprecation): replace usages with HybridMemorySearch before removal
 pub struct PgMemoryStore {
     pool: PgPool,
 }
@@ -258,6 +266,10 @@ fn row_to_entry(row: PgRow) -> Result<MemoryEntry, StewardError> {
             .try_get::<Option<Vector>, _>("embedding")
             .map_err(map_err)?
             .map(|v| v.to_vec()),
+        scope: None,
+        source_session: None,
+        source_channel: None,
+        confidence: None,
     })
 }
 
@@ -346,6 +358,10 @@ mod tests {
             trust_score: trust,
             created_at: Utc::now(),
             embedding: None,
+            scope: None,
+            source_session: None,
+            source_channel: None,
+            confidence: None,
         }
     }
 

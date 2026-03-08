@@ -19,7 +19,7 @@ use uuid::Uuid;
 
 use steward_types::actions::{MemoryEntry, MemoryId, MemoryProvenance, MemorySearchResult};
 use steward_types::errors::StewardError;
-use steward_types::traits::MemorySearch;
+use steward_types::traits::{MemorySearch, MemoryStore};
 
 // ============================================================
 // SQL Migrations
@@ -38,8 +38,22 @@ CREATE TABLE IF NOT EXISTS memories (\
     provenance TEXT NOT NULL DEFAULT 'agent_observation', \
     trust_score DOUBLE PRECISION NOT NULL DEFAULT 0.5, \
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), \
-    embedding vector(1536)\
+    embedding vector(1536), \
+    scope TEXT, \
+    source_session UUID, \
+    source_channel TEXT, \
+    confidence DOUBLE PRECISION\
 )";
+
+/// ALTER TABLE migrations to add new columns to an existing `memories` table.
+///
+/// Safe to run multiple times — `ADD COLUMN IF NOT EXISTS` is idempotent.
+const ALTER_TABLE_MIGRATIONS: &[&str] = &[
+    "ALTER TABLE memories ADD COLUMN IF NOT EXISTS scope TEXT",
+    "ALTER TABLE memories ADD COLUMN IF NOT EXISTS source_session UUID",
+    "ALTER TABLE memories ADD COLUMN IF NOT EXISTS source_channel TEXT",
+    "ALTER TABLE memories ADD COLUMN IF NOT EXISTS confidence DOUBLE PRECISION",
+];
 
 /// SQL migrations for the search module.
 ///
@@ -215,6 +229,16 @@ fn provenance_from_str(s: &str) -> MemoryProvenance {
     }
 }
 
+/// Convert a [`MemoryProvenance`] enum to its snake_case database string.
+pub(crate) fn provenance_to_str(p: MemoryProvenance) -> &'static str {
+    match p {
+        MemoryProvenance::UserInstruction => "user_instruction",
+        MemoryProvenance::AgentObservation => "agent_observation",
+        MemoryProvenance::ExternalContent => "external_content",
+        MemoryProvenance::ToolResult => "tool_result",
+    }
+}
+
 // ============================================================
 // Database Row Extraction
 // ============================================================
@@ -227,6 +251,10 @@ struct SearchCandidate {
     trust_score: f64,
     created_at: DateTime<Utc>,
     embedding_text: Option<String>,
+    scope: Option<String>,
+    source_session: Option<Uuid>,
+    source_channel: Option<String>,
+    confidence: Option<f64>,
 }
 
 /// Extract a `SearchCandidate` from a `sqlx::postgres::PgRow`.
@@ -250,6 +278,18 @@ fn candidate_from_row(row: &sqlx::postgres::PgRow) -> Result<SearchCandidate, St
         embedding_text: row
             .try_get("embedding_text")
             .map_err(|e| StewardError::Database(format!("missing column 'embedding_text': {e}")))?,
+        scope: row
+            .try_get("scope")
+            .map_err(|e| StewardError::Database(format!("missing column 'scope': {e}")))?,
+        source_session: row
+            .try_get("source_session")
+            .map_err(|e| StewardError::Database(format!("missing column 'source_session': {e}")))?,
+        source_channel: row
+            .try_get("source_channel")
+            .map_err(|e| StewardError::Database(format!("missing column 'source_channel': {e}")))?,
+        confidence: row
+            .try_get("confidence")
+            .map_err(|e| StewardError::Database(format!("missing column 'confidence': {e}")))?,
     })
 }
 
@@ -267,6 +307,10 @@ fn candidate_to_entry(c: SearchCandidate) -> Result<MemoryEntry, StewardError> {
         trust_score: c.trust_score,
         created_at: c.created_at,
         embedding,
+        scope: c.scope,
+        source_session: c.source_session,
+        source_channel: c.source_channel,
+        confidence: c.confidence,
     })
 }
 
@@ -279,6 +323,9 @@ fn candidate_to_entry(c: SearchCandidate) -> Result<MemoryEntry, StewardError> {
 /// Combines PostgreSQL full-text search (tsvector/tsquery) with pgvector
 /// cosine similarity search. Results are fused using RRF scoring and
 /// weighted by trust scores to penalize low-trust memories.
+///
+/// Also implements [`MemoryStore`] so that entries written and queried through
+/// the same struct always operate on the unified `memories` table.
 pub struct HybridMemorySearch {
     pool: PgPool,
     config: SearchConfig,
@@ -309,7 +356,8 @@ impl HybridMemorySearch {
     ///
     /// Creates the pgvector extension, the `memories` table, and the FTS and
     /// HNSW indexes. Safe to call on every startup — all statements use
-    /// `IF NOT EXISTS`.
+    /// `IF NOT EXISTS`. Also runs ALTER TABLE migrations to add new columns
+    /// to existing tables.
     pub async fn run_migrations(&self) -> Result<(), StewardError> {
         sqlx::query(EXTENSION_MIGRATION)
             .execute(&self.pool)
@@ -322,6 +370,15 @@ impl HybridMemorySearch {
             .execute(&self.pool)
             .await
             .map_err(|e| StewardError::Database(format!("memories table migration failed: {e}")))?;
+
+        for alter_sql in ALTER_TABLE_MIGRATIONS {
+            sqlx::query(alter_sql)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| {
+                    StewardError::Database(format!("alter table migration failed: {e}"))
+                })?;
+        }
 
         sqlx::query(SEARCH_MIGRATIONS)
             .execute(&self.pool)
@@ -340,31 +397,66 @@ impl HybridMemorySearch {
     /// Perform full-text search using `websearch_to_tsquery`.
     ///
     /// Returns candidates ranked by `ts_rank` score.
+    /// Optionally filters by scope if provided.
     async fn fts_search(
         &self,
         query: &str,
         limit: usize,
+        scope: Option<&str>,
     ) -> Result<Vec<SearchCandidate>, StewardError> {
-        let rows = sqlx::query(
-            r#"
-            SELECT
-                id,
-                content,
-                provenance,
-                trust_score,
-                created_at,
-                embedding::text as embedding_text
-            FROM memories
-            WHERE to_tsvector('english', content) @@ websearch_to_tsquery('english', $1)
-            ORDER BY ts_rank(to_tsvector('english', content), websearch_to_tsquery('english', $1)) DESC
-            LIMIT $2
-            "#,
-        )
-        .bind(query)
-        .bind(limit as i64)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| StewardError::Database(format!("FTS search failed: {e}")))?;
+        let rows = if let Some(scope_val) = scope {
+            sqlx::query(
+                r#"
+                SELECT
+                    id,
+                    content,
+                    provenance,
+                    trust_score,
+                    created_at,
+                    embedding::text as embedding_text,
+                    scope,
+                    source_session,
+                    source_channel,
+                    confidence
+                FROM memories
+                WHERE to_tsvector('english', content) @@ websearch_to_tsquery('english', $1)
+                  AND scope = $3
+                ORDER BY ts_rank(to_tsvector('english', content), websearch_to_tsquery('english', $1)) DESC
+                LIMIT $2
+                "#,
+            )
+            .bind(query)
+            .bind(limit as i64)
+            .bind(scope_val)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StewardError::Database(format!("FTS search failed: {e}")))?
+        } else {
+            sqlx::query(
+                r#"
+                SELECT
+                    id,
+                    content,
+                    provenance,
+                    trust_score,
+                    created_at,
+                    embedding::text as embedding_text,
+                    scope,
+                    source_session,
+                    source_channel,
+                    confidence
+                FROM memories
+                WHERE to_tsvector('english', content) @@ websearch_to_tsquery('english', $1)
+                ORDER BY ts_rank(to_tsvector('english', content), websearch_to_tsquery('english', $1)) DESC
+                LIMIT $2
+                "#,
+            )
+            .bind(query)
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StewardError::Database(format!("FTS search failed: {e}")))?
+        };
 
         rows.iter().map(candidate_from_row).collect()
     }
@@ -372,33 +464,68 @@ impl HybridMemorySearch {
     /// Perform vector similarity search using cosine distance.
     ///
     /// Returns candidates ranked by cosine similarity (highest first).
+    /// Optionally filters by scope if provided.
     async fn vector_search(
         &self,
         embedding: &[f32],
         limit: usize,
+        scope: Option<&str>,
     ) -> Result<Vec<SearchCandidate>, StewardError> {
         let embedding_str = vec_to_pgvector(embedding);
 
-        let rows = sqlx::query(
-            r#"
-            SELECT
-                id,
-                content,
-                provenance,
-                trust_score,
-                created_at,
-                embedding::text as embedding_text
-            FROM memories
-            WHERE embedding IS NOT NULL
-            ORDER BY embedding <=> $1::vector
-            LIMIT $2
-            "#,
-        )
-        .bind(&embedding_str)
-        .bind(limit as i64)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| StewardError::Database(format!("vector search failed: {e}")))?;
+        let rows = if let Some(scope_val) = scope {
+            sqlx::query(
+                r#"
+                SELECT
+                    id,
+                    content,
+                    provenance,
+                    trust_score,
+                    created_at,
+                    embedding::text as embedding_text,
+                    scope,
+                    source_session,
+                    source_channel,
+                    confidence
+                FROM memories
+                WHERE embedding IS NOT NULL
+                  AND scope = $3
+                ORDER BY embedding <=> $1::vector
+                LIMIT $2
+                "#,
+            )
+            .bind(&embedding_str)
+            .bind(limit as i64)
+            .bind(scope_val)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StewardError::Database(format!("vector search failed: {e}")))?
+        } else {
+            sqlx::query(
+                r#"
+                SELECT
+                    id,
+                    content,
+                    provenance,
+                    trust_score,
+                    created_at,
+                    embedding::text as embedding_text,
+                    scope,
+                    source_session,
+                    source_channel,
+                    confidence
+                FROM memories
+                WHERE embedding IS NOT NULL
+                ORDER BY embedding <=> $1::vector
+                LIMIT $2
+                "#,
+            )
+            .bind(&embedding_str)
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StewardError::Database(format!("vector search failed: {e}")))?
+        };
 
         rows.iter().map(candidate_from_row).collect()
     }
@@ -413,15 +540,30 @@ impl HybridMemorySearch {
         query_embedding: Option<&[f32]>,
         limit: usize,
     ) -> Result<Vec<MemorySearchResult>, StewardError> {
+        self.search_scoped(query, query_embedding, limit, None)
+            .await
+    }
+
+    /// Search with an optional scope filter.
+    ///
+    /// If `scope` is `Some`, only entries matching that scope are returned.
+    /// If `scope` is `None`, all entries are searched regardless of scope.
+    pub async fn search_scoped(
+        &self,
+        query: &str,
+        query_embedding: Option<&[f32]>,
+        limit: usize,
+        scope: Option<&str>,
+    ) -> Result<Vec<MemorySearchResult>, StewardError> {
         let effective_limit = limit.min(self.config.candidate_limit);
         let candidate_limit = self.config.candidate_limit;
 
         // Run FTS search
-        let fts_rows = self.fts_search(query, candidate_limit).await?;
+        let fts_rows = self.fts_search(query, candidate_limit, scope).await?;
 
         // Run vector search if embedding is available
         let vector_rows = if let Some(emb) = query_embedding {
-            self.vector_search(emb, candidate_limit).await?
+            self.vector_search(emb, candidate_limit, scope).await?
         } else {
             Vec::new()
         };
@@ -517,6 +659,83 @@ impl MemorySearch for HybridMemorySearch {
     }
 }
 
+#[async_trait]
+impl MemoryStore for HybridMemorySearch {
+    async fn store(&self, entry: MemoryEntry) -> Result<MemoryId, StewardError> {
+        let id = entry.id.unwrap_or_else(Uuid::new_v4);
+        let provenance = provenance_to_str(entry.provenance);
+        let embedding_str = entry.embedding.as_deref().map(vec_to_pgvector);
+
+        sqlx::query(
+            r#"
+            INSERT INTO memories
+                (id, content, provenance, trust_score, created_at, embedding,
+                 scope, source_session, source_channel, confidence)
+            VALUES ($1, $2, $3, $4, $5, $6::vector, $7, $8, $9, $10)
+            ON CONFLICT (id) DO NOTHING
+            "#,
+        )
+        .bind(id)
+        .bind(&entry.content)
+        .bind(provenance)
+        .bind(entry.trust_score)
+        .bind(entry.created_at)
+        .bind(embedding_str)
+        .bind(&entry.scope)
+        .bind(entry.source_session)
+        .bind(&entry.source_channel)
+        .bind(entry.confidence)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StewardError::Database(format!("store failed: {e}")))?;
+
+        Ok(id)
+    }
+
+    async fn get(&self, id: &MemoryId) -> Result<Option<MemoryEntry>, StewardError> {
+        let row = sqlx::query(
+            r#"
+            SELECT
+                id,
+                content,
+                provenance,
+                trust_score,
+                created_at,
+                embedding::text as embedding_text,
+                scope,
+                source_session,
+                source_channel,
+                confidence
+            FROM memories
+            WHERE id = $1
+            "#,
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| StewardError::Database(e.to_string()))?;
+
+        row.map(|r| candidate_from_row(&r).and_then(candidate_to_entry))
+            .transpose()
+    }
+
+    async fn update_trust(&self, id: &MemoryId, score: f64) -> Result<(), StewardError> {
+        let rows_affected = sqlx::query("UPDATE memories SET trust_score = $1 WHERE id = $2")
+            .bind(score)
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StewardError::Database(format!("update_trust failed: {e}")))?
+            .rows_affected();
+
+        if rows_affected == 0 {
+            return Err(StewardError::Memory(format!("entry not found: {id}")));
+        }
+
+        Ok(())
+    }
+}
+
 // ============================================================
 // Tests
 // ============================================================
@@ -524,6 +743,7 @@ impl MemorySearch for HybridMemorySearch {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
 
     // --------------------------------------------------------
     // Unit tests for RRF computation (no database required)
@@ -715,6 +935,45 @@ mod tests {
     }
 
     // --------------------------------------------------------
+    // Unit tests for provenance helpers
+    // --------------------------------------------------------
+
+    #[test]
+    fn test_provenance_to_str_all_variants() {
+        assert_eq!(
+            provenance_to_str(MemoryProvenance::UserInstruction),
+            "user_instruction"
+        );
+        assert_eq!(
+            provenance_to_str(MemoryProvenance::AgentObservation),
+            "agent_observation"
+        );
+        assert_eq!(
+            provenance_to_str(MemoryProvenance::ExternalContent),
+            "external_content"
+        );
+        assert_eq!(
+            provenance_to_str(MemoryProvenance::ToolResult),
+            "tool_result"
+        );
+    }
+
+    #[test]
+    fn test_provenance_roundtrip() {
+        let variants = [
+            MemoryProvenance::UserInstruction,
+            MemoryProvenance::AgentObservation,
+            MemoryProvenance::ExternalContent,
+            MemoryProvenance::ToolResult,
+        ];
+        for v in variants {
+            let s = provenance_to_str(v);
+            let parsed = provenance_from_str(s);
+            assert_eq!(parsed, v);
+        }
+    }
+
+    // --------------------------------------------------------
     // Helper function tests
     // --------------------------------------------------------
 
@@ -786,8 +1045,7 @@ mod tests {
         PgPool::connect(&url).await.ok()
     }
 
-    /// SQL to create the memories table for tests.
-    /// In production, this is handled by workspace.rs.
+    /// SQL to create the memories table for tests (3-dim vectors for speed).
     const TEST_TABLE_SQL: &str = "\
 CREATE EXTENSION IF NOT EXISTS vector;\
 \n\
@@ -797,7 +1055,11 @@ CREATE TABLE IF NOT EXISTS memories (\
     provenance TEXT NOT NULL DEFAULT 'agent_observation',\
     trust_score DOUBLE PRECISION NOT NULL DEFAULT 0.5,\
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),\
-    embedding vector(3)\
+    embedding vector(3),\
+    scope TEXT,\
+    source_session UUID,\
+    source_channel TEXT,\
+    confidence DOUBLE PRECISION\
 );\
 ";
 
@@ -835,6 +1097,107 @@ CREATE TABLE IF NOT EXISTS memories (\
             .execute(pool)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_store_and_search_roundtrip() {
+        let pool = match test_pool().await {
+            Some(p) => p,
+            None => return,
+        };
+        cleanup(&pool).await;
+
+        let search = HybridMemorySearch::new(pool.clone(), SearchConfig::default(), None);
+        search.run_migrations().await.unwrap();
+
+        let entry = MemoryEntry {
+            id: None,
+            content: "Rust is a systems programming language focused on safety".to_string(),
+            provenance: MemoryProvenance::UserInstruction,
+            trust_score: 1.0,
+            created_at: Utc::now(),
+            embedding: None,
+            scope: Some("user".to_string()),
+            source_session: None,
+            source_channel: Some("telegram".to_string()),
+            confidence: Some(0.95),
+        };
+
+        let id = search.store(entry.clone()).await.unwrap();
+
+        let retrieved = search.get(&id).await.unwrap().expect("entry should exist");
+        assert_eq!(retrieved.id, Some(id));
+        assert_eq!(retrieved.content, entry.content);
+        assert_eq!(retrieved.provenance, MemoryProvenance::UserInstruction);
+        assert!((retrieved.trust_score - 1.0).abs() < f64::EPSILON);
+        assert_eq!(retrieved.scope, Some("user".to_string()));
+        assert_eq!(retrieved.source_channel, Some("telegram".to_string()));
+        assert!((retrieved.confidence.unwrap() - 0.95).abs() < f64::EPSILON);
+
+        cleanup(&pool).await;
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_scope_filtering() {
+        let pool = match test_pool().await {
+            Some(p) => p,
+            None => return,
+        };
+        cleanup(&pool).await;
+
+        let search = HybridMemorySearch::new(pool.clone(), SearchConfig::default(), None);
+        search.run_migrations().await.unwrap();
+
+        // Insert entries with different scopes
+        let user_entry = MemoryEntry {
+            id: None,
+            content: "Rust programming is excellent for user-scope work".to_string(),
+            provenance: MemoryProvenance::UserInstruction,
+            trust_score: 1.0,
+            created_at: Utc::now(),
+            embedding: None,
+            scope: Some("user".to_string()),
+            source_session: None,
+            source_channel: None,
+            confidence: None,
+        };
+        let session_entry = MemoryEntry {
+            id: None,
+            content: "Rust programming is excellent for session-scope work".to_string(),
+            provenance: MemoryProvenance::AgentObservation,
+            trust_score: 0.8,
+            created_at: Utc::now(),
+            embedding: None,
+            scope: Some("session".to_string()),
+            source_session: None,
+            source_channel: None,
+            confidence: None,
+        };
+
+        let user_id = search.store(user_entry).await.unwrap();
+        let session_id = search.store(session_entry).await.unwrap();
+
+        // Search with scope=user — should only return user entry
+        let results = search
+            .search_scoped("Rust programming", None, 10, Some("user"))
+            .await
+            .unwrap();
+        let result_ids: Vec<Uuid> = results.iter().filter_map(|r| r.entry.id).collect();
+        assert!(result_ids.contains(&user_id));
+        assert!(!result_ids.contains(&session_id));
+
+        // Search without scope — should return both
+        let results_all = search
+            .search_scoped("Rust programming", None, 10, None)
+            .await
+            .unwrap();
+        let all_ids: Vec<Uuid> = results_all.iter().filter_map(|r| r.entry.id).collect();
+        assert!(all_ids.contains(&user_id));
+        assert!(all_ids.contains(&session_id));
+
+        cleanup(&pool).await;
     }
 
     #[tokio::test]
@@ -1127,6 +1490,23 @@ CREATE TABLE IF NOT EXISTS memories (\
         // Limit to 10 (should return all 5)
         let results = search.search("Rust programming safety", 10).await.unwrap();
         assert_eq!(results.len(), 5);
+
+        cleanup(&pool).await;
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_update_trust_nonexistent() {
+        let pool = match test_pool().await {
+            Some(p) => p,
+            None => return,
+        };
+        cleanup(&pool).await;
+        let search = HybridMemorySearch::new(pool.clone(), SearchConfig::default(), None);
+        search.run_migrations().await.unwrap();
+
+        let result = search.update_trust(&Uuid::new_v4(), 0.5).await;
+        assert!(result.is_err());
 
         cleanup(&pool).await;
     }

@@ -2381,6 +2381,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "pgvector",
+ "reqwest",
  "serde",
  "serde_json",
  "sqlx",
