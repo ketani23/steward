@@ -43,6 +43,12 @@ jobs:
 
             Be concise and specific. Flag only real issues.
 
+            IMPORTANT: Every finding MUST be labeled with a severity prefix.
+            Use exactly one of: [Critical], [High], [Medium], [Low].
+            Format: `N. **[Severity] Brief title**`
+            Example: `1. **[High] SQL injection in query builder**`
+            Do not include findings without a severity label.
+
             PR title and body:
             ----
             ${{ github.event.pull_request.title }}
