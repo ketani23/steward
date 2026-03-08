@@ -75,7 +75,10 @@ You are working on a specific feature branch in a git worktree.
 ## Boundaries
 
 - Do NOT modify files outside your module's scope unless the task explicitly says to
-- Do NOT modify `steward-types/src/traits.rs` — those are the shared contracts
+- Treat `steward-types/src/traits.rs` as a stability boundary — changes require justification:
+  - **Additive changes** (new optional parameters with defaults, new trait methods with default impls, new traits): allowed when the implementation genuinely requires them. Document the reason in the PR description.
+  - **Breaking changes** (removing methods, changing signatures of existing methods): require explicit user approval before proceeding. Note the impact on all downstream impls in the PR description.
+  - **Security-critical traits** (IngressSanitizer, EgressFilter, LeakDetector, PermissionEngine, Guardian): extra caution — changes must not weaken security guarantees.
 - Do NOT modify `docs/architecture.md` or `docs/implementation-plan.md`
 - If you need a new type in `steward-types`, add it to the appropriate file (`actions.rs`, `config.rs`, etc.) and document why
 - If the trait contract seems wrong or insufficient for your implementation, note this in your PR description rather than changing it

@@ -963,6 +963,7 @@ mod tests {
             &self,
             _query: &str,
             _limit: usize,
+            _scope: Option<&str>,
         ) -> Result<Vec<MemorySearchResult>, StewardError> {
             Ok(vec![])
         }

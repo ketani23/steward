@@ -36,11 +36,18 @@ struct EmbeddingData {
 /// Embedding provider backed by the OpenAI `text-embedding-3-small` model.
 ///
 /// Calls `POST https://api.openai.com/v1/embeddings` and returns the
-/// resulting 1536-dimensional vector.
+/// resulting vector. The expected dimensionality is configurable to support
+/// different models (e.g. `text-embedding-3-large` produces 3072 dimensions).
+///
+/// **Note:** The `memories` table column is `vector(1536)` and enforces that
+/// dimension at the database level. Using a different dimension requires a
+/// corresponding schema migration.
 pub struct OpenAiEmbeddingProvider {
     api_key: String,
     model: String,
     client: reqwest::Client,
+    /// Expected number of dimensions from the model. Validated in [`embed`](Self::embed).
+    expected_dimensions: usize,
 }
 
 impl OpenAiEmbeddingProvider {
@@ -64,18 +71,26 @@ impl OpenAiEmbeddingProvider {
             api_key,
             model: "text-embedding-3-small".to_string(),
             client,
+            expected_dimensions: 1536,
         })
     }
 
-    /// Create a provider with a custom model name and pre-built HTTP client.
+    /// Create a provider with a custom model name, pre-built HTTP client, and
+    /// expected embedding dimensions.
     ///
     /// Useful for testing with a mock HTTP server or for using a different
-    /// embedding model.
-    pub fn with_client(api_key: String, model: String, client: reqwest::Client) -> Self {
+    /// embedding model (e.g. `text-embedding-3-large` at 3072 dimensions).
+    pub fn with_client(
+        api_key: String,
+        model: String,
+        client: reqwest::Client,
+        expected_dimensions: usize,
+    ) -> Self {
         Self {
             api_key,
             model,
             client,
+            expected_dimensions,
         }
     }
 }
@@ -126,9 +141,10 @@ impl EmbeddingProvider for OpenAiEmbeddingProvider {
             .map(|d| d.embedding)
             .ok_or_else(|| StewardError::Memory("empty embedding response".to_string()))?;
 
-        if embedding.len() != 1536 {
+        if embedding.len() != self.expected_dimensions {
             return Err(StewardError::Memory(format!(
-                "embedding dimension mismatch: expected 1536, got {}",
+                "embedding dimension mismatch: expected {}, got {}",
+                self.expected_dimensions,
                 embedding.len()
             )));
         }
@@ -164,8 +180,16 @@ mod tests {
             "sk-test".to_string(),
             "text-embedding-3-large".to_string(),
             client,
+            3072,
         );
         assert_eq!(provider.model, "text-embedding-3-large");
+        assert_eq!(provider.expected_dimensions, 3072);
+    }
+
+    #[test]
+    fn test_new_defaults_to_1536_dimensions() {
+        let provider = OpenAiEmbeddingProvider::new("sk-test".to_string()).unwrap();
+        assert_eq!(provider.expected_dimensions, 1536);
     }
 
     // --------------------------------------------------------

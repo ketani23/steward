@@ -15,7 +15,6 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use sqlx::{PgPool, Row};
-use tracing::warn;
 use uuid::Uuid;
 
 use steward_types::actions::{MemoryEntry, MemoryId, MemoryProvenance, MemorySearchResult};
@@ -448,7 +447,7 @@ impl HybridMemorySearch {
                     confidence
                 FROM memories
                 WHERE to_tsvector('english', content) @@ websearch_to_tsquery('english', $1)
-                  AND scope = $3
+                  AND (scope = $3 OR scope = 'shared')
                 ORDER BY ts_rank(to_tsvector('english', content), websearch_to_tsquery('english', $1)) DESC
                 LIMIT $2
                 "#,
@@ -517,7 +516,7 @@ impl HybridMemorySearch {
                     confidence
                 FROM memories
                 WHERE embedding IS NOT NULL
-                  AND scope = $3
+                  AND (scope = $3 OR scope = 'shared')
                 ORDER BY embedding <=> $1::vector
                 LIMIT $2
                 "#,
@@ -574,7 +573,9 @@ impl HybridMemorySearch {
 
     /// Search with an optional scope filter.
     ///
-    /// If `scope` is `Some`, only entries matching that scope are returned.
+    /// If `scope` is `Some`, entries matching that scope **plus** entries with
+    /// `scope = 'shared'` are returned. This ensures shared memories are always
+    /// visible regardless of the requested scope.
     /// If `scope` is `None`, all entries are searched regardless of scope.
     pub async fn search_scoped(
         &self,
@@ -595,7 +596,12 @@ impl HybridMemorySearch {
             match self.vector_search(emb, candidate_limit, scope).await {
                 Ok(rows) => rows,
                 Err(e) => {
-                    warn!("vector search failed, falling back to FTS-only results: {e}");
+                    tracing::error!(
+                        error = %e,
+                        embedding_dims = emb.len(),
+                        query_len = query.len(),
+                        "vector search failed, falling back to FTS-only results"
+                    );
                     Vec::new()
                 }
             }
@@ -676,6 +682,7 @@ impl MemorySearch for HybridMemorySearch {
         &self,
         query: &str,
         limit: usize,
+        scope: Option<&str>,
     ) -> Result<Vec<MemorySearchResult>, StewardError> {
         let embedding = if let Some(provider) = &self.embedding_provider {
             match provider.embed(query).await {
@@ -689,7 +696,7 @@ impl MemorySearch for HybridMemorySearch {
             None
         };
 
-        self.search_with_embedding(query, embedding.as_deref(), limit)
+        self.search_scoped(query, embedding.as_deref(), limit, scope)
             .await
     }
 }
@@ -1585,7 +1592,7 @@ CREATE TABLE IF NOT EXISTS memories (\
         )
         .await;
 
-        let results = search.search("Rust programming", 10).await.unwrap();
+        let results = search.search("Rust programming", 10, None).await.unwrap();
 
         assert!(!results.is_empty());
         // Both Rust-related entries should appear
@@ -1766,7 +1773,7 @@ CREATE TABLE IF NOT EXISTS memories (\
         )
         .await;
 
-        let results = search.search("Rust compiler bugs", 10).await.unwrap();
+        let results = search.search("Rust compiler bugs", 10, None).await.unwrap();
 
         assert!(results.len() >= 2);
 
@@ -1797,7 +1804,7 @@ CREATE TABLE IF NOT EXISTS memories (\
         search.run_migrations().await.unwrap();
 
         // No data inserted — search should return empty
-        let results = search.search("nonexistent query", 10).await.unwrap();
+        let results = search.search("nonexistent query", 10, None).await.unwrap();
         assert!(results.is_empty());
 
         cleanup(&pool).await;
@@ -1824,11 +1831,17 @@ CREATE TABLE IF NOT EXISTS memories (\
         }
 
         // Limit to 2 results
-        let results = search.search("Rust programming safety", 2).await.unwrap();
+        let results = search
+            .search("Rust programming safety", 2, None)
+            .await
+            .unwrap();
         assert!(results.len() <= 2);
 
         // Limit to 10 (should return all 5)
-        let results = search.search("Rust programming safety", 10).await.unwrap();
+        let results = search
+            .search("Rust programming safety", 10, None)
+            .await
+            .unwrap();
         assert_eq!(results.len(), 5);
 
         cleanup(&pool).await;
@@ -1984,6 +1997,83 @@ CREATE TABLE IF NOT EXISTS memories (\
         assert!(
             err_msg.contains("already exists"),
             "error message should mention already exists, got: {err_msg}"
+        );
+
+        cleanup(&pool).await;
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_scoped_search_includes_shared() {
+        let pool = match test_pool().await {
+            Some(p) => p,
+            None => return,
+        };
+        cleanup(&pool).await;
+
+        let search = HybridMemorySearch::new(pool.clone(), SearchConfig::default(), None);
+        search.run_migrations().await.unwrap();
+
+        // Insert a shared entry and a session-scoped entry
+        let shared_entry = MemoryEntry {
+            id: None,
+            content: "Rust programming shared knowledge for everyone".to_string(),
+            provenance: MemoryProvenance::UserInstruction,
+            trust_score: 1.0,
+            created_at: Utc::now(),
+            embedding: None,
+            scope: Some("shared".to_string()),
+            source_session: None,
+            source_channel: None,
+            confidence: None,
+        };
+        let session_entry = MemoryEntry {
+            id: None,
+            content: "Rust programming session-specific context".to_string(),
+            provenance: MemoryProvenance::AgentObservation,
+            trust_score: 0.8,
+            created_at: Utc::now(),
+            embedding: None,
+            scope: Some("session_abc".to_string()),
+            source_session: None,
+            source_channel: None,
+            confidence: None,
+        };
+        let other_session_entry = MemoryEntry {
+            id: None,
+            content: "Rust programming from another session entirely".to_string(),
+            provenance: MemoryProvenance::AgentObservation,
+            trust_score: 0.8,
+            created_at: Utc::now(),
+            embedding: None,
+            scope: Some("session_xyz".to_string()),
+            source_session: None,
+            source_channel: None,
+            confidence: None,
+        };
+
+        let shared_id = search.store(shared_entry).await.unwrap();
+        let session_id = search.store(session_entry).await.unwrap();
+        let other_id = search.store(other_session_entry).await.unwrap();
+
+        // Searching with scope=session_abc should return session_abc + shared, but NOT session_xyz
+        let results = search
+            .search("Rust programming", 10, Some("session_abc"))
+            .await
+            .unwrap();
+        let result_ids: Vec<Uuid> = results.iter().filter_map(|r| r.entry.id).collect();
+
+        assert!(
+            result_ids.contains(&shared_id),
+            "scoped search should include shared entries"
+        );
+        assert!(
+            result_ids.contains(&session_id),
+            "scoped search should include matching scope entries"
+        );
+        assert!(
+            !result_ids.contains(&other_id),
+            "scoped search should exclude entries from other scopes"
         );
 
         cleanup(&pool).await;
