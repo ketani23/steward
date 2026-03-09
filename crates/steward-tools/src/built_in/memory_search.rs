@@ -56,7 +56,7 @@ impl BuiltInHandler for MemorySearchTool {
             .map_err(|e| StewardError::Tool(format!("invalid memory.search parameters: {e}")))?;
 
         let limit = params.limit.unwrap_or(5).min(20);
-        let scope = params.scope.as_deref();
+        let scope = params.scope.as_deref().or(Some("shared"));
         let results = self.memory.search(&params.query, limit, scope).await?;
 
         let formatted: Vec<serde_json::Value> = results

@@ -147,6 +147,19 @@ impl MemorySearch for MockMemory {
     }
 }
 
+#[async_trait]
+impl MemoryStore for MockMemory {
+    async fn store(&self, _entry: MemoryEntry) -> Result<MemoryId, StewardError> {
+        Ok(Uuid::new_v4())
+    }
+    async fn get(&self, _id: &MemoryId) -> Result<Option<MemoryEntry>, StewardError> {
+        Ok(None)
+    }
+    async fn update_trust(&self, _id: &MemoryId, _score: f64) -> Result<(), StewardError> {
+        Ok(())
+    }
+}
+
 /// Mock channel adapter that auto-approves everything.
 struct MockChannel;
 
@@ -249,8 +262,10 @@ async fn build_smoke_agent(llm_responses: Vec<CompletionResponse>) -> (Agent, In
         ingress,
         audit: Arc::new(audit.clone()),
         memory: Arc::new(MockMemory),
+        memory_store: Arc::new(MockMemory),
         channel: Arc::new(MockChannel),
         conversation_store: Arc::new(ConversationStore::new()),
+        extractor: None,
     };
 
     let agent = Agent::new(deps, AgentConfig::default());

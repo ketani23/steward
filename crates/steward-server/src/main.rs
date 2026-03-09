@@ -850,9 +850,11 @@ struct NullMemoryStore;
 impl MemoryStore for NullMemoryStore {
     async fn store(
         &self,
-        entry: MemoryEntry,
+        _entry: MemoryEntry,
     ) -> Result<MemoryId, steward_types::errors::StewardError> {
-        Ok(entry.id.unwrap_or_else(Uuid::new_v4))
+        Err(steward_types::errors::StewardError::Memory(
+            "memory is disabled (no DATABASE_URL configured)".to_string(),
+        ))
     }
     async fn get(
         &self,

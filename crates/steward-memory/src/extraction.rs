@@ -130,7 +130,7 @@ impl FactExtractor {
                     fact.scope_suggestion
                         .unwrap_or_else(|| "shared".to_string()),
                 ),
-                source_session: uuid::Uuid::parse_str(session_id).ok(),
+                source_session: Some(session_id.to_string()),
                 source_channel: Some(channel.to_string()),
                 confidence: Some(fact.confidence.unwrap_or(0.8)),
             };
