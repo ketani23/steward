@@ -2,7 +2,7 @@
 //!
 //! Combines PostgreSQL full-text search with pgvector similarity search,
 //! fused using Reciprocal Rank Fusion (RRF):
-//! - Full-text search via tsvector/tsquery with `websearch_to_tsquery`
+//! - Full-text search via OR-based tsquery for lenient recall, AND-based ranking
 //! - Vector similarity via pgvector cosine distance
 //! - RRF scoring: `score = sum(weight_i / (k + rank_i))`
 //! - Trust score weighting on combined results
@@ -423,34 +423,51 @@ impl HybridMemorySearch {
         Ok(())
     }
 
-    /// Perform full-text search using `websearch_to_tsquery`.
+    /// Perform full-text search with lenient OR-based matching.
     ///
-    /// Returns candidates ranked by `ts_rank` score.
-    /// Optionally filters by scope if provided.
+    /// Uses an OR tsquery for the WHERE filter (any term matches) so that
+    /// conversational filler words in the query don't cause zero results.
+    /// Ranks results using an AND tsquery so entries matching more terms
+    /// score higher. Optionally filters by scope if provided.
     async fn fts_search(
         &self,
         query: &str,
         limit: usize,
         scope: Option<&str>,
     ) -> Result<Vec<SearchCandidate>, StewardError> {
+        // Build an OR tsquery for lenient matching (any term hits) and an AND
+        // tsquery for ranking (more matched terms → higher score).  We derive
+        // the OR variant by text-replacing '&' with '|' in the output of
+        // plainto_tsquery, which already handles stemming and stop-word removal.
         let rows = if let Some(scope_val) = scope {
             sqlx::query(
                 r#"
+                WITH or_query AS (
+                    SELECT to_tsquery('english',
+                        regexp_replace(
+                            plainto_tsquery('english', $1)::text,
+                            ' & ', ' | ', 'g'
+                        )
+                    ) AS q
+                ),
+                and_query AS (
+                    SELECT plainto_tsquery('english', $1) AS q
+                )
                 SELECT
-                    id,
-                    content,
-                    provenance,
-                    trust_score,
-                    created_at,
-                    embedding::text as embedding_text,
-                    scope,
-                    source_session,
-                    source_channel,
-                    confidence
-                FROM memories
-                WHERE to_tsvector('english', content) @@ websearch_to_tsquery('english', $1)
-                  AND (scope = $3 OR scope = 'shared')
-                ORDER BY ts_rank(to_tsvector('english', content), websearch_to_tsquery('english', $1)) DESC
+                    m.id,
+                    m.content,
+                    m.provenance,
+                    m.trust_score,
+                    m.created_at,
+                    m.embedding::text as embedding_text,
+                    m.scope,
+                    m.source_session,
+                    m.source_channel,
+                    m.confidence
+                FROM memories m, or_query oq, and_query aq
+                WHERE to_tsvector('english', m.content) @@ oq.q
+                  AND (m.scope = $3 OR m.scope = 'shared')
+                ORDER BY ts_rank(to_tsvector('english', m.content), aq.q) DESC
                 LIMIT $2
                 "#,
             )
@@ -463,20 +480,31 @@ impl HybridMemorySearch {
         } else {
             sqlx::query(
                 r#"
+                WITH or_query AS (
+                    SELECT to_tsquery('english',
+                        regexp_replace(
+                            plainto_tsquery('english', $1)::text,
+                            ' & ', ' | ', 'g'
+                        )
+                    ) AS q
+                ),
+                and_query AS (
+                    SELECT plainto_tsquery('english', $1) AS q
+                )
                 SELECT
-                    id,
-                    content,
-                    provenance,
-                    trust_score,
-                    created_at,
-                    embedding::text as embedding_text,
-                    scope,
-                    source_session,
-                    source_channel,
-                    confidence
-                FROM memories
-                WHERE to_tsvector('english', content) @@ websearch_to_tsquery('english', $1)
-                ORDER BY ts_rank(to_tsvector('english', content), websearch_to_tsquery('english', $1)) DESC
+                    m.id,
+                    m.content,
+                    m.provenance,
+                    m.trust_score,
+                    m.created_at,
+                    m.embedding::text as embedding_text,
+                    m.scope,
+                    m.source_session,
+                    m.source_channel,
+                    m.confidence
+                FROM memories m, or_query oq, and_query aq
+                WHERE to_tsvector('english', m.content) @@ oq.q
+                ORDER BY ts_rank(to_tsvector('english', m.content), aq.q) DESC
                 LIMIT $2
                 "#,
             )

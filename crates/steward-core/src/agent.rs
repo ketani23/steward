@@ -681,7 +681,15 @@ impl Agent {
     /// Retrieve relevant context from memory.
     async fn retrieve_context(&self, query: &str) -> Vec<MemorySearchResult> {
         match self.memory.search(query, 5, None).await {
-            Ok(results) => results,
+            Ok(results) => {
+                tracing::debug!(
+                    query = %query,
+                    count = results.len(),
+                    "Memory recall returned {} result(s)",
+                    results.len()
+                );
+                results
+            }
             Err(e) => {
                 tracing::warn!(error = %e, "Memory search failed, continuing without context");
                 vec![]
