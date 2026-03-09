@@ -15,6 +15,7 @@
 use std::sync::Arc;
 
 use chrono::Utc;
+use tokio::sync::Semaphore;
 use uuid::Uuid;
 
 use steward_types::actions::*;
@@ -32,6 +33,9 @@ const MAX_TOOL_TURNS: usize = 10;
 
 /// Default timeout for human approval requests (seconds).
 const APPROVAL_TIMEOUT_SECS: u64 = 300;
+
+/// Maximum number of concurrent post-turn extraction tasks.
+const MAX_CONCURRENT_EXTRACTIONS: usize = 3;
 
 /// Configuration for the agent core.
 #[derive(Debug, Clone)]
@@ -121,6 +125,8 @@ pub struct Agent {
     channel: Arc<dyn ChannelAdapter>,
     conversation_store: Arc<ConversationStore>,
     extractor: Option<Arc<FactExtractor>>,
+    /// Limits concurrent post-turn extraction tasks.
+    extraction_semaphore: Arc<Semaphore>,
     router: MessageRouter,
     config: AgentConfig,
 }
@@ -141,6 +147,7 @@ impl Agent {
             channel: deps.channel,
             conversation_store: deps.conversation_store,
             extractor: deps.extractor,
+            extraction_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_EXTRACTIONS)),
             router: MessageRouter::new(),
             config,
         }
@@ -355,18 +362,27 @@ impl Agent {
 
         // Step 9: Post-turn fact extraction (async, non-blocking)
         if let Some(extractor) = self.extractor.clone() {
-            let user_msg = sanitized.text.clone();
-            let agent_resp = final_response.clone();
-            let sess = session_key.clone();
-            let ch = format!("{:?}", message.channel);
-            tokio::spawn(async move {
-                if let Err(e) = extractor
-                    .extract_from_turn(&user_msg, &agent_resp, &sess, &ch)
-                    .await
-                {
-                    tracing::warn!(error = %e, "Post-turn fact extraction failed");
+            let sem = self.extraction_semaphore.clone();
+            match sem.try_acquire_owned() {
+                Ok(permit) => {
+                    let user_msg = sanitized.text.clone();
+                    let agent_resp = final_response.clone();
+                    let sess = session_key.clone();
+                    let ch = format!("{:?}", message.channel);
+                    tokio::spawn(async move {
+                        if let Err(e) = extractor
+                            .extract_from_turn(&user_msg, &agent_resp, &sess, &ch)
+                            .await
+                        {
+                            tracing::warn!(error = %e, "Post-turn fact extraction failed");
+                        }
+                        drop(permit);
+                    });
                 }
-            });
+                Err(_) => {
+                    tracing::warn!("Skipping post-turn extraction: concurrency limit reached");
+                }
+            }
         }
 
         Ok(final_response)

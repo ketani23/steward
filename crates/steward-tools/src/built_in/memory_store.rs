@@ -69,7 +69,7 @@ impl BuiltInHandler for MemoryStoreTool {
         let entry = MemoryEntry {
             id: None,
             content: params.content,
-            provenance: MemoryProvenance::AgentObservation,
+            provenance: MemoryProvenance::UserInstruction,
             trust_score: 0.6,
             created_at: chrono::Utc::now(),
             embedding: None,
