@@ -32,6 +32,7 @@ tiers:
       # will take effect automatically.  Until then, all shell invocations fall
       # through to the "shell.exec" entry in human_approval below.
       - shell.exec.readonly
+      - memory.store
     constraints:
       rate_limit: 30/minute
 
