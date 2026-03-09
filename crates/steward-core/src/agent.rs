@@ -683,7 +683,6 @@ impl Agent {
         match self.memory.search(query, 5, None).await {
             Ok(results) => {
                 tracing::debug!(
-                    query = %query,
                     count = results.len(),
                     "Memory recall returned {} result(s)",
                     results.len()
