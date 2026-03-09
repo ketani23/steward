@@ -439,82 +439,26 @@ impl HybridMemorySearch {
         // tsquery for ranking (more matched terms → higher score).  We derive
         // the OR variant by text-replacing '&' with '|' in the output of
         // plainto_tsquery, which already handles stemming and stop-word removal.
-
-        // Guard: if the query is empty or contains only stop-words/punctuation,
-        // plainto_tsquery returns an empty tsquery which causes to_tsquery to
-        // fail.  Detect this cheaply by checking whether any alphanumeric
-        // characters remain after stripping common English stop-words and
-        // non-word characters.
-        let has_searchable_terms = query.split_whitespace().any(|w| {
-            let w = w.to_lowercase();
-            w.chars().any(|c| c.is_alphanumeric())
-                && !matches!(
-                    w.as_str(),
-                    "a" | "an"
-                        | "the"
-                        | "is"
-                        | "are"
-                        | "was"
-                        | "were"
-                        | "be"
-                        | "been"
-                        | "being"
-                        | "have"
-                        | "has"
-                        | "had"
-                        | "do"
-                        | "does"
-                        | "did"
-                        | "will"
-                        | "would"
-                        | "could"
-                        | "should"
-                        | "may"
-                        | "might"
-                        | "shall"
-                        | "can"
-                        | "of"
-                        | "in"
-                        | "to"
-                        | "for"
-                        | "with"
-                        | "on"
-                        | "at"
-                        | "by"
-                        | "from"
-                        | "it"
-                        | "its"
-                        | "this"
-                        | "that"
-                        | "and"
-                        | "or"
-                        | "not"
-                        | "no"
-                        | "but"
-                        | "if"
-                        | "so"
-                        | "as"
-                        | "just"
-                )
-        });
-
-        if !has_searchable_terms {
-            return Ok(Vec::new());
-        }
+        //
+        // Empty-query guard is handled in SQL: if plainto_tsquery produces an
+        // empty tsquery (all stop-words / punctuation), the `parsed` CTE
+        // filters it out and the query returns zero rows.
 
         let rows = if let Some(scope_val) = scope {
             sqlx::query(
                 r#"
-                WITH or_query AS (
+                WITH parsed AS (
+                    SELECT plainto_tsquery('english', $1) AS aq
+                    WHERE length(plainto_tsquery('english', $1)::text) > 0
+                ),
+                or_query AS (
                     SELECT to_tsquery('english',
-                        regexp_replace(
-                            plainto_tsquery('english', $1)::text,
-                            ' & ', ' | ', 'g'
-                        )
+                        regexp_replace(aq::text, ' & ', ' | ', 'g')
                     ) AS q
+                    FROM parsed
                 ),
                 and_query AS (
-                    SELECT plainto_tsquery('english', $1) AS q
+                    SELECT aq AS q FROM parsed
                 )
                 SELECT
                     m.id,
@@ -543,16 +487,18 @@ impl HybridMemorySearch {
         } else {
             sqlx::query(
                 r#"
-                WITH or_query AS (
+                WITH parsed AS (
+                    SELECT plainto_tsquery('english', $1) AS aq
+                    WHERE length(plainto_tsquery('english', $1)::text) > 0
+                ),
+                or_query AS (
                     SELECT to_tsquery('english',
-                        regexp_replace(
-                            plainto_tsquery('english', $1)::text,
-                            ' & ', ' | ', 'g'
-                        )
+                        regexp_replace(aq::text, ' & ', ' | ', 'g')
                     ) AS q
+                    FROM parsed
                 ),
                 and_query AS (
-                    SELECT plainto_tsquery('english', $1) AS q
+                    SELECT aq AS q FROM parsed
                 )
                 SELECT
                     m.id,
