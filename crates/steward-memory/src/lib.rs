@@ -7,6 +7,7 @@
 /// - **Integrity**: Periodic audit for memory poisoning detection
 /// - **Embedding**: OpenAI embedding provider for vector search
 pub mod embedding;
+pub mod extraction;
 pub mod integrity;
 pub mod provenance;
 pub mod search;

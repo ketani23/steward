@@ -6,6 +6,7 @@ description = "Core agent loop for Steward: LLM interaction, guardian review, pe
 
 [dependencies]
 steward-types.workspace = true
+steward-memory.workspace = true
 async-trait.workspace = true
 tokio.workspace = true
 serde.workspace = true

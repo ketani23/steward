@@ -41,13 +41,15 @@ use steward_tools::built_in::file_edit::FileEditTool;
 use steward_tools::built_in::file_list::FileListTool;
 use steward_tools::built_in::file_read::FileReadTool;
 use steward_tools::built_in::file_write::FileWriteTool;
+use steward_tools::built_in::memory_search::MemorySearchTool;
+use steward_tools::built_in::memory_store::MemoryStoreTool;
 use steward_tools::built_in::shell::{ShellConfig, ShellTool};
 use steward_tools::built_in::workspace::workspace_root;
 use steward_tools::registry::ToolRegistryImpl;
-use steward_types::actions::{ChannelType, InboundMessage, OutboundMessage};
+use steward_types::actions::{ChannelType, InboundMessage, MemoryEntry, MemoryId, OutboundMessage};
 use steward_types::config::IdentityConfig;
 use steward_types::config_loader::ConfigLoader;
-use steward_types::traits::{AuditLogger, ChannelAdapter};
+use steward_types::traits::{AuditLogger, ChannelAdapter, MemoryStore};
 use uuid::Uuid;
 
 /// Steward — security-hardened autonomous AI agent.
@@ -290,21 +292,77 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     // ── 7. Memory (requires DB) ─────────────────────────────────
-    let memory: Arc<dyn steward_types::traits::MemorySearch> = if let Some(ref pool) = db_pool {
-        let search = steward_memory::search::HybridMemorySearch::new(
+    #[allow(clippy::type_complexity)]
+    let (memory, memory_store, extractor): (
+        Arc<dyn steward_types::traits::MemorySearch>,
+        Arc<dyn MemoryStore>,
+        Option<Arc<steward_memory::extraction::FactExtractor>>,
+    ) = if let Some(ref pool) = db_pool {
+        // Build embedding provider if OPENAI_API_KEY is set
+        let embedding_provider: Option<Arc<dyn steward_memory::search::EmbeddingProvider>> =
+            match std::env::var("OPENAI_API_KEY") {
+                Ok(key) => match steward_memory::embedding::OpenAiEmbeddingProvider::new(key) {
+                    Ok(p) => Some(Arc::new(p) as _),
+                    Err(e) => {
+                        warn!("Failed to create embedding provider: {e}");
+                        None
+                    }
+                },
+                Err(_) => {
+                    warn!("OPENAI_API_KEY not set — vector search disabled, using FTS only");
+                    None
+                }
+            };
+
+        let search = Arc::new(steward_memory::search::HybridMemorySearch::new(
             pool.clone(),
             steward_memory::search::SearchConfig::default(),
-            None, // No embedding provider yet — FTS only
-        );
+            embedding_provider,
+        ));
+
         search
             .run_migrations()
             .await
             .map_err(|e| format!("Memory migration failed: {e}"))?;
-        info!("Memory table and indexes ready");
-        Arc::new(search)
+        info!("Memory table and indexes ready (with scope column)");
+
+        // FactExtractor uses a Haiku-class LLM for cheap extraction
+        let haiku_llm: Arc<dyn steward_types::traits::LlmProvider> =
+            Arc::new(AnthropicProvider::new(cli.anthropic_api_key.clone()));
+        let extractor = Arc::new(steward_memory::extraction::FactExtractor::new(
+            haiku_llm,
+            search.clone() as Arc<dyn MemoryStore>,
+            search.clone() as Arc<dyn steward_types::traits::MemorySearch>,
+            steward_memory::extraction::ExtractionConfig::default(),
+        ));
+
+        (
+            search.clone() as Arc<dyn steward_types::traits::MemorySearch>,
+            search as Arc<dyn MemoryStore>,
+            Some(extractor),
+        )
     } else {
-        Arc::new(NullMemorySearch)
+        warn!("No DATABASE_URL — memory disabled");
+        (
+            Arc::new(NullMemorySearch) as Arc<dyn steward_types::traits::MemorySearch>,
+            Arc::new(NullMemoryStore) as Arc<dyn MemoryStore>,
+            None,
+        )
     };
+
+    // Memory tools
+    tools
+        .register_built_in(
+            MemorySearchTool::tool_definition(),
+            Arc::new(MemorySearchTool::new(memory.clone())),
+        )
+        .await?;
+    tools
+        .register_built_in(
+            MemoryStoreTool::tool_definition(),
+            Arc::new(MemoryStoreTool::new(memory_store.clone())),
+        )
+        .await?;
 
     // ── 8. Channel manager ──────────────────────────────────────
     // Create manager → register adapters → start_listening() → THEN wrap in Arc.
@@ -377,8 +435,10 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         ingress,
         audit: audit.clone(),
         memory,
+        memory_store,
         channel: channel.clone(),
         conversation_store: Arc::new(ConversationStore::new()),
+        extractor,
     };
 
     let agent = Arc::new(Agent::new(deps, agent_config));
@@ -783,6 +843,34 @@ impl steward_types::traits::MemorySearch for NullMemorySearch {
     }
 }
 
+/// No-op memory store that discards writes.
+struct NullMemoryStore;
+
+#[async_trait]
+impl MemoryStore for NullMemoryStore {
+    async fn store(
+        &self,
+        _entry: MemoryEntry,
+    ) -> Result<MemoryId, steward_types::errors::StewardError> {
+        Err(steward_types::errors::StewardError::Memory(
+            "memory is disabled (no DATABASE_URL configured)".to_string(),
+        ))
+    }
+    async fn get(
+        &self,
+        _id: &MemoryId,
+    ) -> Result<Option<MemoryEntry>, steward_types::errors::StewardError> {
+        Ok(None)
+    }
+    async fn update_trust(
+        &self,
+        _id: &MemoryId,
+        _score: f64,
+    ) -> Result<(), steward_types::errors::StewardError> {
+        Ok(())
+    }
+}
+
 /// Console-based channel adapter for local testing.
 ///
 /// Prints responses to stdout and auto-approves actions.
@@ -1004,8 +1092,10 @@ mod tests {
                 ingress: Arc::new(MockIngress),
                 audit: Arc::new(MockAudit),
                 memory: Arc::new(MockMemory),
+                memory_store: Arc::new(NullMemoryStore),
                 channel: Arc::new(MockChannel),
                 conversation_store: Arc::new(ConversationStore::new()),
+                extractor: None,
             },
             AgentConfig::default(),
         ))

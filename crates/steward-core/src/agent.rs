@@ -15,12 +15,15 @@
 use std::sync::Arc;
 
 use chrono::Utc;
+use tokio::sync::Semaphore;
 use uuid::Uuid;
 
 use steward_types::actions::*;
 use steward_types::config::{KnownAgentConfig, OwnerConfig};
 use steward_types::errors::StewardError;
 use steward_types::traits::*;
+
+use steward_memory::extraction::FactExtractor;
 
 use crate::conversation::ConversationStore;
 use crate::router::{MessageIntent, MessageRouter};
@@ -30,6 +33,9 @@ const MAX_TOOL_TURNS: usize = 10;
 
 /// Default timeout for human approval requests (seconds).
 const APPROVAL_TIMEOUT_SECS: u64 = 300;
+
+/// Maximum number of concurrent post-turn extraction tasks.
+const MAX_CONCURRENT_EXTRACTIONS: usize = 3;
 
 /// Configuration for the agent core.
 #[derive(Debug, Clone)]
@@ -90,10 +96,14 @@ pub struct AgentDeps {
     pub audit: Arc<dyn AuditLogger>,
     /// Memory search for context retrieval.
     pub memory: Arc<dyn MemorySearch>,
+    /// Memory store for persisting facts.
+    pub memory_store: Arc<dyn MemoryStore>,
     /// Channel adapter for sending messages and approval requests.
     pub channel: Arc<dyn ChannelAdapter>,
     /// Conversation history store for multi-turn sessions.
     pub conversation_store: Arc<ConversationStore>,
+    /// Post-turn fact extraction pipeline (None if memory is disabled).
+    pub extractor: Option<Arc<FactExtractor>>,
 }
 
 /// The main agent orchestrator.
@@ -110,8 +120,13 @@ pub struct Agent {
     ingress: Arc<dyn IngressSanitizer>,
     audit: Arc<dyn AuditLogger>,
     memory: Arc<dyn MemorySearch>,
+    #[allow(dead_code)]
+    memory_store: Arc<dyn MemoryStore>,
     channel: Arc<dyn ChannelAdapter>,
     conversation_store: Arc<ConversationStore>,
+    extractor: Option<Arc<FactExtractor>>,
+    /// Limits concurrent post-turn extraction tasks.
+    extraction_semaphore: Arc<Semaphore>,
     router: MessageRouter,
     config: AgentConfig,
 }
@@ -128,8 +143,11 @@ impl Agent {
             ingress: deps.ingress,
             audit: deps.audit,
             memory: deps.memory,
+            memory_store: deps.memory_store,
             channel: deps.channel,
             conversation_store: deps.conversation_store,
+            extractor: deps.extractor,
+            extraction_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_EXTRACTIONS)),
             router: MessageRouter::new(),
             config,
         }
@@ -341,6 +359,31 @@ impl Agent {
             sanitized.text.clone(),
             final_response.clone(),
         );
+
+        // Step 9: Post-turn fact extraction (async, non-blocking)
+        if let Some(extractor) = self.extractor.clone() {
+            let sem = self.extraction_semaphore.clone();
+            match sem.try_acquire_owned() {
+                Ok(permit) => {
+                    let user_msg = sanitized.text.clone();
+                    let agent_resp = final_response.clone();
+                    let sess = session_key.clone();
+                    let ch = format!("{:?}", message.channel);
+                    tokio::spawn(async move {
+                        if let Err(e) = extractor
+                            .extract_from_turn(&user_msg, &agent_resp, &sess, &ch)
+                            .await
+                        {
+                            tracing::warn!(error = %e, "Post-turn fact extraction failed");
+                        }
+                        drop(permit);
+                    });
+                }
+                Err(_) => {
+                    tracing::warn!("Skipping post-turn extraction: concurrency limit reached");
+                }
+            }
+        }
 
         Ok(final_response)
     }
@@ -1460,6 +1503,21 @@ mod tests {
         }
     }
 
+    struct MockMemoryStore;
+
+    #[async_trait::async_trait]
+    impl MemoryStore for MockMemoryStore {
+        async fn store(&self, entry: MemoryEntry) -> Result<MemoryId, StewardError> {
+            Ok(entry.id.unwrap_or_else(Uuid::new_v4))
+        }
+        async fn get(&self, _id: &MemoryId) -> Result<Option<MemoryEntry>, StewardError> {
+            Ok(None)
+        }
+        async fn update_trust(&self, _id: &MemoryId, _score: f64) -> Result<(), StewardError> {
+            Ok(())
+        }
+    }
+
     struct MockMemoryWithContext;
 
     #[async_trait::async_trait]
@@ -1562,8 +1620,10 @@ mod tests {
             ingress: Arc::new(MockIngress),
             audit,
             memory: Arc::new(MockMemory),
+            memory_store: Arc::new(MockMemoryStore),
             channel: Arc::new(MockChannel::approving()),
             conversation_store: Arc::new(ConversationStore::new()),
+            extractor: None,
         }
     }
 

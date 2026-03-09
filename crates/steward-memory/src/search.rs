@@ -40,7 +40,7 @@ CREATE TABLE IF NOT EXISTS memories (\
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), \
     embedding vector(1536), \
     scope TEXT NOT NULL DEFAULT 'shared', \
-    source_session UUID, \
+    source_session TEXT, \
     source_channel TEXT, \
     confidence DOUBLE PRECISION\
 )";
@@ -50,7 +50,9 @@ CREATE TABLE IF NOT EXISTS memories (\
 /// Safe to run multiple times — `ADD COLUMN IF NOT EXISTS` is idempotent.
 const ALTER_TABLE_MIGRATIONS: &[&str] = &[
     "ALTER TABLE memories ADD COLUMN IF NOT EXISTS scope TEXT NOT NULL DEFAULT 'shared'",
-    "ALTER TABLE memories ADD COLUMN IF NOT EXISTS source_session UUID",
+    "ALTER TABLE memories ADD COLUMN IF NOT EXISTS source_session TEXT",
+    // Migrate existing UUID columns to TEXT (idempotent — no-op if already TEXT).
+    "ALTER TABLE memories ALTER COLUMN source_session TYPE TEXT USING source_session::text",
     "ALTER TABLE memories ADD COLUMN IF NOT EXISTS source_channel TEXT",
     "ALTER TABLE memories ADD COLUMN IF NOT EXISTS confidence DOUBLE PRECISION",
     // Backfill: ensure any pre-existing NULL scope values are set and column is NOT NULL.
@@ -279,7 +281,7 @@ struct SearchCandidate {
     created_at: DateTime<Utc>,
     embedding_text: Option<String>,
     scope: Option<String>,
-    source_session: Option<Uuid>,
+    source_session: Option<String>,
     source_channel: Option<String>,
     confidence: Option<f64>,
 }
@@ -1404,7 +1406,7 @@ CREATE TABLE IF NOT EXISTS memories (\
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),\
     embedding vector(3),\
     scope TEXT NOT NULL DEFAULT 'shared',\
-    source_session UUID,\
+    source_session TEXT,\
     source_channel TEXT,\
     confidence DOUBLE PRECISION\
 );\
